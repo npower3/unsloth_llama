@@ -10,3 +10,6 @@ conda create -n llama-sft python=3.10 pytorch pytorch-cuda=12.1 -c pytorch -c nv
 
 # Install Unsloth after requirements with:
 # pip install "unsloth @ git+https://github.com/unslothai/unsloth.git"
+
+pip install transformers datasets accelerate peft trl bitsandbytes
+pip install "unsloth @ git+https://github.com/unslothai/unsloth.git"
