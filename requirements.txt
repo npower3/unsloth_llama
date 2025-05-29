@@ -21,5 +21,9 @@ python -m ipykernel install --user --name=llama-sft-env --display-name="Llama SF
 # Complete clean reinstall
 pip uninstall torch torchvision torchaudio transformers unsloth -y
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+
+pip install torch torchvision torchaudio --index-url "https://download.pytorch.org/whl/cu121"
+
+
 pip install transformers datasets accelerate peft trl bitsandbytes
 pip install "unsloth @ git+https://github.com/unslothai/unsloth.git"
