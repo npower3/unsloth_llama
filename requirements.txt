@@ -1,29 +1,8 @@
-# Essential packages for Llama SFT with Unsloth
-torch>=2.1.0
-transformers>=4.36.0
-datasets>=2.14.0
-accelerate>=0.24.0
-peft>=0.7.0
-trl>=0.7.0
-bitsandbytes>=0.41.0
-conda create -n llama-sft python=3.10 pytorch pytorch-cuda=12.1 -c pytorch -c nvidia -y
+conda create --name unsloth_env \
+    python=3.11 \
+    pytorch-cuda=12.1 \
+    pytorch cudatoolkit xformers -c pytorch -c nvidia -c xformers \
+    -y
+conda activate unsloth_env
 
-# Install Unsloth after requirements with:
-# pip install "unsloth @ git+https://github.com/unslothai/unsloth.git"
-
-pip install transformers datasets accelerate peft trl bitsandbytes
-pip install "unsloth @ git+https://github.com/unslothai/unsloth.git"
-
-# Register the environment as a Jupyter kernel
-python -m ipykernel install --user --name=llama-sft-env --display-name="Llama SFT"
-
-
-# Complete clean reinstall
-pip uninstall torch torchvision torchaudio transformers unsloth -y
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
-
-pip install torch torchvision torchaudio --index-url "https://download.pytorch.org/whl/cu121"
-
-
-pip install transformers datasets accelerate peft trl bitsandbytes
-pip install "unsloth @ git+https://github.com/unslothai/unsloth.git"
+pip install unsloth
