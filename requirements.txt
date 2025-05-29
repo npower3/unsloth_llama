@@ -13,3 +13,6 @@ conda create -n llama-sft python=3.10 pytorch pytorch-cuda=12.1 -c pytorch -c nv
 
 pip install transformers datasets accelerate peft trl bitsandbytes
 pip install "unsloth @ git+https://github.com/unslothai/unsloth.git"
+
+# Register the environment as a Jupyter kernel
+python -m ipykernel install --user --name=llama-sft-env --display-name="Llama SFT"
