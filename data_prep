@@ -1,0 +1,70 @@
+import xml.etree.ElementTree as ET
+from xml.dom import minidom
+
+def prettify_xml(elem):
+    """Return a pretty-printed XML string for the Element."""
+    rough_string = ET.tostring(elem, 'utf-8')
+    reparsed = minidom.parseString(rough_string)
+    return reparsed.toprettyxml(indent="  ")
+
+def generate_xml_prompt(sample_input, sample_output, meme_mapping):
+    """
+    Generates an XML prompt for a data transformation task.
+
+    Parameters:
+    - sample_input (dict): A sample input record.
+    - sample_output (dict): The corresponding expected output record.
+    - meme_mapping (dict): Mapping rules for the 'MEME_rel' column.
+
+    Returns:
+    - str: The formatted XML prompt as a string.
+    """
+    # Root element
+    root = ET.Element('prompt')
+
+    # Response element
+    response = ET.SubElement(root, 'response')
+    for col, val in sample_output.items():
+        col_elem = ET.SubElement(response, col)
+        col_elem.text = str(val)
+
+    # Reason element
+    reason = ET.SubElement(root, 'reason')
+    reason.text = (
+        "The 'MEME_rel' field requires transformation based on a predefined mapping. "
+        "Other fields such as 'Name' and 'Age' do not require code mapping and are transferred directly."
+    )
+
+    # MEME_rel Mapping
+    mapping_elem = ET.SubElement(root, 'MEME_rel_mapping')
+    for src_val, tgt_val in meme_mapping.items():
+        map_elem = ET.SubElement(mapping_elem, 'map', source=str(src_val))
+        map_elem.text = str(tgt_val)
+
+    return prettify_xml(root)
+
+# Example usage:
+
+sample_input = {
+    "Name": "John Doe",
+    "Age": 30,
+    "MEME_rel": 1
+}
+
+sample_output = {
+    "Name": "John Doe",
+    "Age": 30,
+    "MEME_rel": 100
+}
+
+meme_mapping = {
+    1: 100,
+    2: 200,
+    3: 300
+}
+
+# Generate the XML prompt
+xml_prompt = generate_xml_prompt(sample_input, sample_output, meme_mapping)
+
+# Output the XML prompt
+print(xml_prompt)
