@@ -1,0 +1,125 @@
+def generate_prompt_string(sample_input, sample_output, relationship_mapping):
+    # Construct system prompt
+    system_prompt = (
+        "<system_prompt>\n"
+        "You are an expert in healthcare data interoperability and transformation. "
+        "Your task is to convert member eligibility records from a source format to a standardized target format, "
+        "ensuring compliance with interoperability standards such as HL7 FHIR and CMS regulations.\n\n"
+        "Objectives:\n"
+        "1. Data Mapping: Accurately map fields from the source schema to the target schema, applying necessary transformations to align with standardized terminologies and codes.\n"
+        "2. Code Translation: Implement code translations where required. For example, transform relationship codes like '1' to standardized codes like 'Spouse' in the target schema.\n"
+        "3. Data Integrity: Ensure that all transformed data maintains integrity, with consistent and accurate representation across the target dataset.\n"
+        "4. Compliance: Adhere to relevant healthcare data standards and regulations to facilitate seamless data exchange between systems.\n"
+        "</system_prompt>\n"
+    )
+
+    # Construct table definitions
+    table_definitions = (
+        "<table_definitions>\n"
+        "  <source_table>\n"
+        "    <column name=\"MemberID\" type=\"string\" />\n"
+        "    <column name=\"FirstName\" type=\"string\" />\n"
+        "    <column name=\"LastName\" type=\"string\" />\n"
+        "    <column name=\"DateOfBirth\" type=\"date\" />\n"
+        "    <column name=\"Gender\" type=\"string\" />\n"
+        "    <column name=\"PlanCode\" type=\"string\" />\n"
+        "    <column name=\"CoverageStartDate\" type=\"date\" />\n"
+        "    <column name=\"CoverageEndDate\" type=\"date\" />\n"
+        "    <column name=\"RelationshipCode\" type=\"string\" />\n"
+        "  </source_table>\n"
+        "  <target_table>\n"
+        "    <column name=\"MemberID\" type=\"string\" />\n"
+        "    <column name=\"FullName\" type=\"string\" />\n"
+        "    <column name=\"DateOfBirth\" type=\"date\" />\n"
+        "    <column name=\"Gender\" type=\"string\" />\n"
+        "    <column name=\"PlanCode\" type=\"string\" />\n"
+        "    <column name=\"CoveragePeriod\" type=\"object\">\n"
+        "      <field name=\"Start\" type=\"date\" />\n"
+        "      <field name=\"End\" type=\"date\" />\n"
+        "    </column>\n"
+        "    <column name=\"Relationship\" type=\"string\" />\n"
+        "  </target_table>\n"
+        "</table_definitions>\n"
+    )
+
+    # Construct input XML
+    input_xml = "<input>\n"
+    for key, value in sample_input.items():
+        input_xml += f"  <{key}>{value}</{key}>\n"
+    input_xml += "</input>\n"
+
+    # Construct response XML
+    response_xml = "<response>\n"
+    for key, value in sample_output.items():
+        if isinstance(value, dict):
+            response_xml += f"  <{key}>\n"
+            for sub_key, sub_value in value.items():
+                response_xml += f"    <{sub_key}>{sub_value}</{sub_key}>\n"
+            response_xml += f"  </{key}>\n"
+        else:
+            response_xml += f"  <{key}>{value}</{key}>\n"
+    response_xml += "</response>\n"
+
+    # Construct reason
+    reason_text = (
+        "<reason>\n"
+        "The 'RelationshipCode' field requires transformation based on a predefined mapping. "
+        "Other fields such as 'MemberID', 'FullName', 'DateOfBirth', 'Gender', 'PlanCode', and 'CoveragePeriod' "
+        "are transferred directly or reformatted without code mapping.\n"
+        "</reason>\n"
+    )
+
+    # Construct RelationshipCode mapping
+    mapping_xml = "<RelationshipCode_mapping>\n"
+    for src_val, tgt_val in relationship_mapping.items():
+        mapping_xml += f"  <map source=\"{src_val}\">{tgt_val}</map>\n"
+    mapping_xml += "</RelationshipCode_mapping>\n"
+
+    # Combine all parts
+    full_prompt = (
+        system_prompt + "\n" +
+        table_definitions + "\n" +
+        input_xml + "\n" +
+        response_xml + "\n" +
+        reason_text + "\n" +
+        mapping_xml
+    )
+
+    return full_prompt
+
+# Example usage
+sample_input = {
+    "MemberID": "A123456789",
+    "FirstName": "John",
+    "LastName": "Doe",
+    "DateOfBirth": "1980-05-15",
+    "Gender": "M",
+    "PlanCode": "PLN001",
+    "CoverageStartDate": "2021-01-01",
+    "CoverageEndDate": "2021-12-31",
+    "RelationshipCode": "1"
+}
+
+sample_output = {
+    "MemberID": "A123456789",
+    "FullName": "John Doe",
+    "DateOfBirth": "1980-05-15",
+    "Gender": "Male",
+    "PlanCode": "PLN001",
+    "CoveragePeriod": {
+        "Start": "2021-01-01",
+        "End": "2021-12-31"
+    },
+    "Relationship": "Spouse"
+}
+
+relationship_mapping = {
+    "1": "Spouse",
+    "2": "Child",
+    "3": "Self",
+    "4": "Other"
+}
+
+# Generate and print the prompt
+prompt = generate_prompt_string(sample_input, sample_output, relationship_mapping)
+print(prompt)
