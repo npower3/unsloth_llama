@@ -1,37 +1,20 @@
 import xml.etree.ElementTree as ET
 from xml.dom import minidom
-system_prompt = """
-System Prompt:
 
-You are an expert in healthcare data interoperability and transformation. Your task is to convert member eligibility records from a source format to a standardized target format, ensuring compliance with interoperability standards such as HL7 FHIR and CMS regulations.
-Kohezion
-+1
-MCG Health
-+1
-
-Objectives:
-
-Data Mapping: Accurately map fields from the source schema to the target schema, applying necessary transformations to align with standardized terminologies and codes.
-
-Code Translation: Implement code translations where required. For example, transform relationship codes like '1' to standardized codes like '100' in the target schema.
-
-Data Integrity: Ensure that all transformed data maintains integrity, with consistent and accurate representation across the target dataset.
-
-"""
 def prettify_xml(elem):
     """Return a pretty-printed XML string for the Element."""
     rough_string = ET.tostring(elem, 'utf-8')
     reparsed = minidom.parseString(rough_string)
     return reparsed.toprettyxml(indent="  ")
 
-def generate_xml_prompt(sample_input, sample_output, meme_mapping):
+def generate_xml_prompt(sample_input, sample_output, relationship_mapping):
     """
     Generates an XML prompt for a data transformation task.
 
     Parameters:
     - sample_input (dict): A sample input record.
     - sample_output (dict): The corresponding expected output record.
-    - meme_mapping (dict): Mapping rules for the 'MEME_rel' column.
+    - relationship_mapping (dict): Mapping rules for the 'RelationshipCode' field.
 
     Returns:
     - str: The formatted XML prompt as a string.
@@ -39,22 +22,35 @@ def generate_xml_prompt(sample_input, sample_output, meme_mapping):
     # Root element
     root = ET.Element('prompt')
 
+    # Input element
+    input_elem = ET.SubElement(root, 'input')
+    for col, val in sample_input.items():
+        col_elem = ET.SubElement(input_elem, col)
+        col_elem.text = str(val)
+
     # Response element
     response = ET.SubElement(root, 'response')
     for col, val in sample_output.items():
-        col_elem = ET.SubElement(response, col)
-        col_elem.text = str(val)
+        if isinstance(val, dict):
+            col_elem = ET.SubElement(response, col)
+            for sub_col, sub_val in val.items():
+                sub_elem = ET.SubElement(col_elem, sub_col)
+                sub_elem.text = str(sub_val)
+        else:
+            col_elem = ET.SubElement(response, col)
+            col_elem.text = str(val)
 
     # Reason element
     reason = ET.SubElement(root, 'reason')
     reason.text = (
-        "The 'MEME_rel' field requires transformation based on a predefined mapping. "
-        "Other fields such as 'Name' and 'Age' do not require code mapping and are transferred directly."
+        "The 'RelationshipCode' field requires transformation based on a predefined mapping. "
+        "Other fields such as 'MemberID', 'FullName', 'DateOfBirth', 'Gender', 'PlanCode', and 'CoveragePeriod' "
+        "are transferred directly or reformatted without code mapping."
     )
 
-    # MEME_rel Mapping
-    mapping_elem = ET.SubElement(root, 'MEME_rel_mapping')
-    for src_val, tgt_val in meme_mapping.items():
+    # RelationshipCode Mapping
+    mapping_elem = ET.SubElement(root, 'RelationshipCode_mapping')
+    for src_val, tgt_val in relationship_mapping.items():
         map_elem = ET.SubElement(mapping_elem, 'map', source=str(src_val))
         map_elem.text = str(tgt_val)
 
@@ -63,25 +59,39 @@ def generate_xml_prompt(sample_input, sample_output, meme_mapping):
 # Example usage:
 
 sample_input = {
-    "Name": "John Doe",
-    "Age": 30,
-    "MEME_rel": 1
+    "MemberID": "A123456789",
+    "FirstName": "John",
+    "LastName": "Doe",
+    "DateOfBirth": "1980-05-15",
+    "Gender": "M",
+    "PlanCode": "PLN001",
+    "CoverageStartDate": "2021-01-01",
+    "CoverageEndDate": "2021-12-31",
+    "RelationshipCode": "1"
 }
 
 sample_output = {
-    "Name": "John Doe",
-    "Age": 30,
-    "MEME_rel": 100
+    "MemberID": "A123456789",
+    "FullName": "John Doe",
+    "DateOfBirth": "1980-05-15",
+    "Gender": "Male",
+    "PlanCode": "PLN001",
+    "CoveragePeriod": {
+        "Start": "2021-01-01",
+        "End": "2021-12-31"
+    },
+    "Relationship": "Spouse"
 }
 
-meme_mapping = {
-    1: 100,
-    2: 200,
-    3: 300
+relationship_mapping = {
+    "1": "Spouse",
+    "2": "Child",
+    "3": "Self",
+    "4": "Other"
 }
 
 # Generate the XML prompt
-xml_prompt = generate_xml_prompt(sample_input, sample_output, meme_mapping)
+xml_prompt = generate_xml_prompt(sample_input, sample_output, relationship_mapping)
 
 # Output the XML prompt
 print(xml_prompt)
