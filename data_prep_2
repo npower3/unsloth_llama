@@ -185,3 +185,9 @@ for _, row in df_merged.iterrows():
 
 # Output the chat prompts as JSON
 print(json.dumps(chat_prompts, indent=2))
+
+
+with open('chat_prompts.jsonl', 'w', encoding='utf-8') as f:
+    for chat in chat_prompts:
+        json_line = json.dumps(chat, ensure_ascii=False)
+        f.write(json_line + '\n')
