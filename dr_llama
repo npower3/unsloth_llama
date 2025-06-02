@@ -200,3 +200,7 @@ def load_and_format_dataset(tokenizer=None):
 
     print(f"Loaded {len(train_dataset)} training and {len(val_dataset)} validation examples.")
     return DatasetDict({"train": train_dataset, "validation": val_dataset})
+
+
+def formatting_func(example):
+    return f"<s>[INST] {example['instruction']} [/INST] {example['response']}</s>"
