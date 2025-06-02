@@ -1,285 +1,289 @@
-# Simple Llama Fine-tuning with Unsloth
-# A clean, straightforward notebook for supervised fine-tuning
+#!/usr/bin/env python3
+"""
+Fine-tuning script for Llama model using Unsloth and SFT
+Converted from Jupyter notebook to standalone Python script
+DEBUGGED VERSION - Fixed common issues causing repetitive outputs
+"""
 
-# ============================================================================
-# CELL 1: Install Dependencies
-# ============================================================================
-
-# Install required packages
-!pip install "unsloth[colab-new] @ git+https://github.com/unslothai/unsloth.git"
-!pip install --no-deps trl peft accelerate bitsandbytes
-
-# ============================================================================
-# CELL 2: Import Libraries
-# ============================================================================
-
+# Core imports
 import torch
-from unsloth import FastLanguageModel
-from datasets import Dataset
-from trl import SFTTrainer
-from transformers import TrainingArguments
+from unsloth import FastLanguageModel, is_bfloat16_supported
+from datasets import load_dataset
+from trl import SFTTrainer, SFTConfig
+from transformers import TrainingArguments, TrainerCallback
 import json
 
-# Check GPU
-print(f"GPU available: {torch.cuda.is_available()}")
-if torch.cuda.is_available():
-    print(f"GPU name: {torch.cuda.get_device_name()}")
-    print(f"GPU memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
+# Configuration parameters
+MAX_SEQ_LENGTH = 2048  # Choose any! We auto support RoPE Scaling internally!
+DTYPE = None  # None for auto detection. Float16 for Tesla T4, V100, Bfloat16 for Ampere+
+LOAD_IN_4BIT = False  # Use 4bit quantization to reduce memory usage. Can be False.
 
-# ============================================================================
-# CELL 3: Configuration (Easy to modify)
-# ============================================================================
+# Model configuration
+MODEL_LOC = "/mnt/batch/tasks/shared/LS_root/mounts/clusters/nishanth-gpu/code/users/domakonda_nishanth/SFT/models/llama3-7b-instruct"
 
-# Model settings
-MODEL_NAME = "unsloth/llama-2-7b-chat-bnb-4bit"  # Change this for different models
-MAX_SEQ_LENGTH = 2048
-
-# Training settings
-BATCH_SIZE = 2
-LEARNING_RATE = 2e-4
-EPOCHS = 1
-OUTPUT_DIR = "./llama-finetuned"
-
-# LoRA settings (keep these for efficiency)
-LORA_R = 16
-LORA_ALPHA = 16
-
-print("Configuration loaded!")
-
-# ============================================================================
-# CELL 4: Load Model
-# ============================================================================
-
-# Load model and tokenizer with Unsloth optimizations
-model, tokenizer = FastLanguageModel.from_pretrained(
-    model_name=MODEL_NAME,
-    max_seq_length=MAX_SEQ_LENGTH,
-    dtype=None,  # Auto-detect
-    load_in_4bit=True,  # Use 4-bit for memory efficiency
-)
-
-print("✅ Model loaded successfully!")
-
-# ============================================================================
-# CELL 5: Setup LoRA
-# ============================================================================
-
-# Add LoRA adapters for efficient fine-tuning
-model = FastLanguageModel.get_peft_model(
-    model,
-    r=LORA_R,
-    target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
-                   "gate_proj", "up_proj", "down_proj"],
-    lora_alpha=LORA_ALPHA,
-    lora_dropout=0,
-    bias="none",
-    use_gradient_checkpointing="unsloth",
-    random_state=42,
-)
-
-# Show trainable parameters
-trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-total_params = sum(p.numel() for p in model.parameters())
-
-print(f"✅ LoRA setup complete!")
-print(f"Trainable parameters: {trainable_params:,}")
-print(f"Total parameters: {total_params:,}")
-print(f"Trainable %: {100 * trainable_params / total_params:.2f}%")
-
-# ============================================================================
-# CELL 6: Prepare Your Data
-# ============================================================================
-
-# Option 1: Use sample data (replace with your own)
-sample_data = [
-    {
-        "text": "### Human: What is machine learning?\n### Assistant: Machine learning is a branch of artificial intelligence that enables computers to learn and make decisions from data without being explicitly programmed for every task."
-    },
-    {
-        "text": "### Human: Explain neural networks simply.\n### Assistant: Neural networks are computing systems inspired by the human brain. They consist of interconnected nodes (neurons) that process information and learn patterns from data."
-    },
-    {
-        "text": "### Human: What is Python used for?\n### Assistant: Python is a versatile programming language used for web development, data science, machine learning, automation, and many other applications due to its simplicity and extensive libraries."
-    },
-    {
-        "text": "### Human: How do I start learning programming?\n### Assistant: Start with a beginner-friendly language like Python, practice with small projects, use online tutorials, and gradually build more complex applications as you gain confidence."
-    }
-]
-
-# Option 2: Load from file (uncomment and modify as needed)
-# with open('your_data.json', 'r') as f:
-#     sample_data = json.load(f)
-
-# Option 3: Load from HuggingFace dataset (uncomment and modify)
-# from datasets import load_dataset
-# dataset = load_dataset("your-dataset-name")
-# sample_data = dataset["train"]
-
-# Create dataset
-dataset = Dataset.from_list(sample_data)
-print(f"✅ Dataset loaded with {len(dataset)} examples")
-print(f"Sample: {dataset[0]['text'][:100]}...")
-
-# ============================================================================
-# CELL 7: Setup Training
-# ============================================================================
-
-# Training arguments
-training_args = TrainingArguments(
-    per_device_train_batch_size=BATCH_SIZE,
-    gradient_accumulation_steps=4,
-    warmup_steps=5,
-    num_train_epochs=EPOCHS,
-    learning_rate=LEARNING_RATE,
-    fp16=not torch.cuda.is_bf16_supported(),
-    bf16=torch.cuda.is_bf16_supported(),
-    logging_steps=1,
-    optim="adamw_8bit",
-    weight_decay=0.01,
-    lr_scheduler_type="linear",
-    seed=42,
-    output_dir=OUTPUT_DIR,
-    save_strategy="epoch",
-    report_to=None,  # Disable wandb/tensorboard for simplicity
-)
-
-# Create trainer
-trainer = SFTTrainer(
-    model=model,
-    tokenizer=tokenizer,
-    train_dataset=dataset,
-    dataset_text_field="text",
-    max_seq_length=MAX_SEQ_LENGTH,
-    dataset_num_proc=2,
-    packing=False,
-    args=training_args,
-)
-
-print("✅ Trainer setup complete!")
-
-# ============================================================================
-# CELL 8: Start Training
-# ============================================================================
-
-print("🚀 Starting training...")
-print("This may take a while depending on your data size and GPU...")
-
-# Show memory before training
-gpu_stats = torch.cuda.get_device_properties(0)
-start_gpu_memory = round(torch.cuda.max_memory_reserved() / 1024 / 1024 / 1024, 3)
-max_memory = round(gpu_stats.total_memory / 1024 / 1024 / 1024, 3)
-print(f"GPU memory before training: {start_gpu_memory} GB / {max_memory} GB")
-
-# Train the model
-trainer_stats = trainer.train()
-
-# Show memory after training
-used_memory = round(torch.cuda.max_memory_reserved() / 1024 / 1024 / 1024, 3)
-used_memory_for_training = round(used_memory - start_gpu_memory, 3)
-used_percentage = round(used_memory / max_memory * 100, 3)
-
-print(f"✅ Training completed!")
-print(f"Final GPU memory: {used_memory} GB / {max_memory} GB ({used_percentage}%)")
-print(f"Memory used for training: {used_memory_for_training} GB")
-print(f"Training loss: {trainer_stats.training_loss:.4f}")
-
-# ============================================================================
-# CELL 9: Save Model
-# ============================================================================
-
-# Save the fine-tuned model
-model.save_pretrained(OUTPUT_DIR)
-tokenizer.save_pretrained(OUTPUT_DIR)
-
-print(f"✅ Model saved to {OUTPUT_DIR}")
-
-# Optional: Save to HuggingFace Hub
-# model.push_to_hub("your-username/your-model-name", token="your-token")
-# tokenizer.push_to_hub("your-username/your-model-name", token="your-token")
-
-# ============================================================================
-# CELL 10: Test Your Model
-# ============================================================================
-
-# Enable fast inference
-FastLanguageModel.for_inference(model)
-
-# Test function
-def chat_with_model(question, max_length=200):
-    prompt = f"### Human: {question}\n### Assistant:"
+def setup_model_and_tokenizer():
+    """Initialize and configure the model and tokenizer"""
+    print("Loading model and tokenizer...")
     
-    inputs = tokenizer(prompt, return_tensors="pt").to("cuda")
+    model, tokenizer = FastLanguageModel.from_pretrained(
+        model_name=MODEL_LOC,
+        max_seq_length=MAX_SEQ_LENGTH,
+        dtype=DTYPE,
+        load_in_4bit=LOAD_IN_4BIT,
+    )
+    
+    # FIX 1: Ensure pad_token is set properly
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+        print("Set pad_token to eos_token")
+    
+    # Configure model with PEFT (LoRA) - ADJUSTED PARAMETERS
+    model = FastLanguageModel.get_peft_model(
+        model,
+        r=16,  # INCREASED from 8 - higher rank for better learning
+        target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
+                       "gate_proj", "up_proj", "down_proj"],
+        lora_alpha=32,  # INCREASED from 16 - better scaling
+        lora_dropout=0.1,  # INCREASED from 0 - prevents overfitting
+        bias="none",  # Supports any, but = "none" is optimized
+        use_gradient_checkpointing="unsloth",  # True or "unsloth" for very long context
+        random_state=3407,
+        use_rslora=False,  # We support rank stabilized LoRA
+        loftq_config=None,  # And LoftQ
+    )
+    
+    return model, tokenizer
+
+def validate_dataset_format(dataset_path):
+    """Validate the format of the dataset"""
+    print(f"Validating dataset format: {dataset_path}")
+    
+    with open(dataset_path, 'r') as f:
+        sample_lines = [f.readline() for _ in range(3)]
+    
+    for i, line in enumerate(sample_lines):
+        if line.strip():
+            try:
+                data = json.loads(line)
+                print(f"Sample {i+1}:")
+                print(f"  Keys: {list(data.keys())}")
+                if 'messages' in data:
+                    print(f"  Messages count: {len(data['messages'])}")
+                    for j, msg in enumerate(data['messages'][:2]):  # Show first 2 messages
+                        print(f"    Message {j+1}: role='{msg.get('role', 'MISSING')}', content_length={len(msg.get('content', ''))}")
+                print()
+            except json.JSONDecodeError as e:
+                print(f"  ERROR parsing line {i+1}: {e}")
+
+def load_and_format_dataset(tokenizer):
+    """Load and format the training dataset"""
+    print("Loading dataset...")
+    
+    # FIX 2: Validate dataset format first
+    train_path = "../data/yahoo_training_file_v1.jsonl"
+    val_path = "../data/yahoo_val_file_v1.jsonl"
+    
+    validate_dataset_format(train_path)
+    
+    # Load dataset
+    dataset = load_dataset(
+        "json", 
+        data_files={
+            "train": train_path,
+            "validation": val_path
+        }
+    )
+    
+    def format_chat(example):
+        """Format chat template for training - IMPROVED VERSION"""
+        try:
+            # FIX 3: Add proper template formatting with add_generation_prompt
+            formatted_text = tokenizer.apply_chat_template(
+                example["messages"], 
+                tokenize=False,
+                add_generation_prompt=False  # Important for training
+            )
+            
+            # FIX 4: Ensure the text ends properly for training
+            if not formatted_text.endswith(tokenizer.eos_token):
+                formatted_text += tokenizer.eos_token
+                
+            return {"text": formatted_text}
+            
+        except Exception as e:
+            print(f"Error formatting example: {e}")
+            print(f"Example messages: {example.get('messages', 'NO MESSAGES')}")
+            return {"text": ""}  # Return empty text for problematic examples
+    
+    # Format datasets
+    train_dataset = dataset["train"]
+    validation_dataset = dataset["validation"]
+    
+    print("Formatting training dataset...")
+    formatted_train_dataset = train_dataset.map(format_chat, remove_columns=train_dataset.column_names)
+    
+    print("Formatting validation dataset...")
+    formatted_validation_dataset = validation_dataset.map(format_chat, remove_columns=validation_dataset.column_names)
+    
+    # FIX 5: Filter out empty examples
+    formatted_train_dataset = formatted_train_dataset.filter(lambda x: len(x["text"].strip()) > 0)
+    formatted_validation_dataset = formatted_validation_dataset.filter(lambda x: len(x["text"].strip()) > 0)
+    
+    return formatted_train_dataset, formatted_validation_dataset
+
+class PrintLogsCallback(TrainerCallback):
+    """Custom callback to print logs to console"""
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        if logs:
+            print(f"Step {state.global_step}: {logs}")
+
+def setup_training_config():
+    """Configure SFT training parameters - IMPROVED VERSION"""
+    sft_config = SFTConfig(
+        output_dir="outputs",
+        per_device_train_batch_size=1,  # REDUCED to prevent memory issues
+        gradient_accumulation_steps=8,  # INCREASED to maintain effective batch size
+        warmup_steps=50,  # INCREASED for better training stability
+        num_train_epochs=3,  # INCREASED - 1 epoch might not be enough
+        max_steps=1000,  # INCREASED for more training
+        learning_rate=5e-5,  # REDUCED - lower learning rate often works better
+        logging_dir="outputs/logs",
+        logging_strategy="steps",
+        logging_steps=10,
+        eval_steps=50,  # INCREASED - less frequent evaluation
+        eval_strategy="steps",
+        save_strategy="steps",  # CHANGED from "yes"
+        save_steps=100,  # Save checkpoints
+        fp16=not is_bfloat16_supported(),
+        bf16=is_bfloat16_supported(),
+        optim="adamw_8bit",
+        weight_decay=0.01,
+        lr_scheduler_type="cosine",  # CHANGED from linear
+        seed=3407,
+        report_to=["none"],
+        dataloader_num_workers=0,  # FIX 6: Prevent multiprocessing issues
+        remove_unused_columns=False,  # FIX 7: Keep all columns
+    )
+    
+    return sft_config
+
+def main():
+    """Main training function"""
+    print("Starting fine-tuning process...")
+    
+    # Setup model and tokenizer
+    model, tokenizer = setup_model_and_tokenizer()
+    
+    # Load and format datasets
+    formatted_train_dataset, formatted_validation_dataset = load_and_format_dataset(tokenizer)
+    
+    # Print dataset info
+    print(f"Training dataset size: {len(formatted_train_dataset)}")
+    print(f"Validation dataset size: {len(formatted_validation_dataset)}")
+    
+    # FIX 8: Show example of formatted data more clearly
+    print("\nExample training data:")
+    example_text = formatted_train_dataset["text"][0]
+    print("="*80)
+    print(example_text)
+    print("="*80)
+    print(f"Text length: {len(example_text)}")
+    print(f"Contains EOS token: {tokenizer.eos_token in example_text}")
+    
+    # FIX 9: Check for potential issues in the data
+    print("\nData quality checks:")
+    text_lengths = [len(text) for text in formatted_train_dataset["text"][:100]]
+    print(f"Average text length (first 100): {sum(text_lengths)/len(text_lengths):.1f}")
+    print(f"Min text length: {min(text_lengths)}")
+    print(f"Max text length: {max(text_lengths)}")
+    
+    # Setup training configuration
+    sft_config = setup_training_config()
+    
+    # Create trainer
+    trainer = SFTTrainer(
+        model=model,
+        tokenizer=tokenizer,
+        train_dataset=formatted_train_dataset,
+        eval_dataset=formatted_validation_dataset,
+        dataset_text_field="text",
+        max_seq_length=MAX_SEQ_LENGTH,
+        dataset_num_proc=1,  # REDUCED to prevent issues
+        packing=False,
+        args=sft_config,
+    )
+    
+    # Add logging callback
+    trainer.add_callback(PrintLogsCallback())
+    
+    # FIX 10: Print model info before training
+    print(f"\nModel info:")
+    print(f"Model device: {next(model.parameters()).device}")
+    print(f"Model dtype: {next(model.parameters()).dtype}")
+    print(f"Trainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad)}")
+    print(f"Total parameters: {sum(p.numel() for p in model.parameters())}")
+    
+    # Start training
+    print("Starting training...")
+    trainer.train()
+    
+    # Save model
+    print("Saving model...")
+    trainer.save_model("outputs/final_model")
+    
+    print("Training completed!")
+    
+    # Optional: Test the model with a sample input
+    test_model(model, tokenizer)
+
+def test_model(model, tokenizer):
+    """Test the fine-tuned model with sample input - IMPROVED VERSION"""
+    print("\n" + "="*50)
+    print("Testing the fine-tuned model...")
+    
+    # Enable fast inference
+    FastLanguageModel.for_inference(model)
+    
+    # FIX 11: Better test prompt format
+    test_messages = [
+        {"role": "system", "content": "You are an expert in healthcare data interoperability and transformation."},
+        {"role": "user", "content": "Convert this healthcare data format from HL7 to FHIR."}
+    ]
+    
+    test_prompt = tokenizer.apply_chat_template(
+        test_messages, 
+        tokenize=False,
+        add_generation_prompt=True  # This adds the assistant token for generation
+    )
+    
+    print("Test prompt:")
+    print(test_prompt)
+    print("-" * 30)
+    
+    # Tokenize and generate
+    inputs = tokenizer(test_prompt, return_tensors="pt", padding=True).to("cuda")
     
     with torch.no_grad():
         outputs = model.generate(
-            **inputs,
-            max_new_tokens=max_length,
-            use_cache=True,
+            inputs["input_ids"],
+            max_new_tokens=128,  # REDUCED for cleaner output
+            attention_mask=inputs["attention_mask"],
+            eos_token_id=tokenizer.eos_token_id,
+            pad_token_id=tokenizer.pad_token_id,
             do_sample=True,
-            temperature=0.7,
-            top_p=0.9,
-            pad_token_id=tokenizer.eos_token_id,
+            temperature=0.7,  # FIX 12: Add temperature for better generation
+            top_p=0.9,  # FIX 13: Add top_p for better generation
+            repetition_penalty=1.1  # FIX 14: Prevent repetition
         )
     
-    response = tokenizer.decode(outputs[0], skip_special_tokens=True)
-    # Extract just the assistant's response
-    assistant_response = response.split("### Assistant:")[-1].strip()
-    return assistant_response
+    # Decode and print result
+    # FIX 15: Only show the generated part, not the input
+    generated_tokens = outputs[0][inputs["input_ids"].shape[1]:]
+    decoded_output = tokenizer.decode(generated_tokens, skip_special_tokens=True)
+    
+    print("Model output (generated part only):")
+    print(decoded_output)
+    print("="*50)
 
-# Test with some questions
-test_questions = [
-    "What is artificial intelligence?",
-    "How do computers work?",
-    "Explain the concept of algorithms",
-]
-
-print("🧪 Testing your fine-tuned model:\n")
-for question in test_questions:
-    print(f"Q: {question}")
-    answer = chat_with_model(question)
-    print(f"A: {answer}\n")
-    print("-" * 50)
-
-# ============================================================================
-# CELL 11: Export for Production (Optional)
-# ============================================================================
-
-# Option 1: Export to GGUF format for llama.cpp
-# model.save_pretrained_gguf(OUTPUT_DIR, tokenizer, quantization_method="q4_k_m")
-
-# Option 2: Export to merged format (combines base model + LoRA)
-# model.save_pretrained_merged(OUTPUT_DIR, tokenizer, save_method="merged_16bit")
-
-print("✅ All done! Your model is ready to use.")
-print(f"Model saved in: {OUTPUT_DIR}")
-print("\nTo use your model later:")
-print("1. Load with: FastLanguageModel.from_pretrained('path/to/model')")
-print("2. Use the chat_with_model() function above")
-print("3. Or integrate into your applications!")
-
-# ============================================================================
-# CELL 12: Quick Usage Summary
-# ============================================================================
-
-print("""
-📋 QUICK SUMMARY:
-
-1. 🔧 Modified configuration in Cell 3
-2. 📊 Loaded model and setup LoRA in Cells 4-5  
-3. 📁 Prepared your data in Cell 6
-4. 🏃 Trained the model in Cells 7-8
-5. 💾 Saved the model in Cell 9
-6. 🧪 Tested the model in Cell 10
-
-🎯 NEXT STEPS:
-- Replace sample data with your own dataset
-- Adjust hyperparameters if needed
-- Test with more examples
-- Deploy your model!
-
-💡 TIPS:
-- Increase EPOCHS for better results
-- Add more training data for better performance  
-- Monitor GPU memory usage
-- Use validation data to prevent overfitting
-""")
+if __name__ == "__main__":
+    main()
