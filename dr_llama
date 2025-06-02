@@ -155,3 +155,48 @@ out = model.generate(
     eos_token_id=tokenizer.eos_token_id,
 )
 print(tokenizer.decode(out[0][tok.input_ids.shape[1]:], skip_special_tokens=True))
+
+from datasets import Dataset, DatasetDict
+import json
+
+def convert_chat_to_instruction_format(chat_entry):
+    """Extracts instruction and response from a chat-style message list."""
+    messages = chat_entry["messages"]
+    instruction_parts = []
+    response = ""
+
+    for msg in messages:
+        if msg["role"] == "assistant":
+            response = msg["content"]
+            break
+        instruction_parts.append(msg["content"])
+
+    instruction = "\n".join(instruction_parts).strip()
+    response = response.strip()
+
+    return {"instruction": instruction, "response": response}
+
+def load_and_format_dataset(tokenizer=None):
+    """Loads chat-format .jsonl and converts to instruction-response datasets"""
+    print("Loading and converting chat-format dataset...")
+
+    train_path = "../data/yahoo_training_file_v1.jsonl"
+    val_path = "../data/yahoo_val_file_v1.jsonl"
+
+    def load_and_convert(path):
+        data = []
+        with open(path, "r") as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                chat = json.loads(line)
+                formatted = convert_chat_to_instruction_format(chat)
+                if formatted["instruction"] and formatted["response"]:
+                    data.append(formatted)
+        return Dataset.from_list(data)
+
+    train_dataset = load_and_convert(train_path)
+    val_dataset = load_and_convert(val_path)
+
+    print(f"Loaded {len(train_dataset)} training and {len(val_dataset)} validation examples.")
+    return DatasetDict({"train": train_dataset, "validation": val_dataset})
