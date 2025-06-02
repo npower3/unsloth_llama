@@ -1,0 +1,107 @@
+from transformers import AutoTokenizer, AutoModelForCausalLM, Trainer, TrainingArguments
+
+# --- [Step 1] Load model and tokenizer ---
+model_name = "your-llama-base-or-instruct-model"  # e.g., "meta-llama/Llama-2-7b-hf"
+tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=False)
+model = AutoModelForCausalLM.from_pretrained(model_name)
+
+# If using LoRA or PEFT, load the base and prepare for LoRA here (not shown for brevity)
+
+# --- [Step 4] Fix tokenizer special tokens ---
+if tokenizer.pad_token_id is None:
+    tokenizer.add_special_tokens({"pad_token": "<pad>"})
+    model.resize_token_embeddings(len(tokenizer))
+# Ensure model config knows the pad token
+model.config.pad_token_id = tokenizer.pad_token_id
+
+# --- [Step 2] Define custom data collator for masking prompt tokens ---
+from dataclasses import dataclass
+import torch
+
+@dataclass
+class PromptCompletionDataCollator:
+    tokenizer: AutoTokenizer
+    max_length: int = None  # optional: set max length for truncation
+    
+    def __call__(self, examples):
+        input_ids_list = []
+        labels_list = []
+        for ex in examples:
+            user_prompt = ex["instruction"] if "instruction" in ex else ex.get("prompt", ex.get("input", ""))
+            assistant_resp = ex["response"] if "response" in ex else ex.get("output", "")
+            # Format with [INST] template
+            bos = self.tokenizer.bos_token or "<s>"
+            eos = self.tokenizer.eos_token or "</s>"
+            prompt_text = f"{bos}[INST] {user_prompt.strip()} [/INST] "
+            completion_text = f"{assistant_resp.strip()}{eos}"
+            full_text = prompt_text + completion_text
+            # Tokenize the combined text
+            tokens = self.tokenizer(full_text, truncation=True, max_length=self.max_length, 
+                                     add_special_tokens=False)
+            input_ids = tokens["input_ids"]
+            # Prepare labels: copy of input_ids
+            labels = input_ids.copy()
+            # Mask user prompt portion in labels
+            prompt_length = len(self.tokenizer(prompt_text, add_special_tokens=False)["input_ids"])
+            for i in range(min(prompt_length, len(labels))):
+                labels[i] = -100
+            # Append to lists as tensors
+            input_ids_list.append(torch.tensor(input_ids, dtype=torch.long))
+            labels_list.append(torch.tensor(labels, dtype=torch.long))
+        # Pad sequences in the batch
+        input_ids_batch = torch.nn.utils.rnn.pad_sequence(input_ids_list, batch_first=True, 
+                                                          padding_value=self.tokenizer.pad_token_id)
+        labels_batch = torch.nn.utils.rnn.pad_sequence(labels_list, batch_first=True, 
+                                                      padding_value=-100)
+        attention_mask = (input_ids_batch != self.tokenizer.pad_token_id).long()
+        return {"input_ids": input_ids_batch, "attention_mask": attention_mask, "labels": labels_batch}
+
+data_collator = PromptCompletionDataCollator(tokenizer=tokenizer, max_length=512)
+
+# --- [Prepare dataset] ---
+# Assume `train_dataset` is a list or Dataset of dicts with 'instruction' and 'response' keys.
+# For example:
+# train_dataset = [{"instruction": "Question1", "response": "Answer1"}, {"instruction": "Question2", "response": "Answer2"}, ...]
+# If using HuggingFace datasets, wrap the collator in Trainer (it will map over dataset).
+# Otherwise, you may need to manually format examples via dataset.map with the collator (if not using Trainer).
+
+# --- [Training setup] ---
+training_args = TrainingArguments(
+    output_dir="outputs/llama-finetune",
+    per_device_train_batch_size=1,
+    gradient_accumulation_steps=8,
+    num_train_epochs=3,
+    learning_rate=2e-4,
+    fp16=True,
+    logging_steps=50,
+    save_steps=200,
+    report_to="none"
+)
+trainer = Trainer(
+    model=model,
+    train_dataset=train_dataset,       # your training data
+    # eval_dataset=eval_dataset,      # optional evaluation data
+    tokenizer=tokenizer,
+    data_collator=data_collator,
+    args=training_args
+)
+print("Starting training...")
+trainer.train()
+print("Training complete!")
+
+# --- [Step 3] Inference with adjusted generation params ---
+prompt = "How do I calculate the area of a circle?"
+# Format prompt as model input (no answer part)
+input_ids = tokenizer(f"<s>[INST] {prompt} [/INST]", return_tensors="pt").input_ids.to(model.device)
+# Generation parameters to reduce repetition
+generation_config = {
+    "max_new_tokens": 100,
+    "temperature": 0.7,
+    "top_p": 0.9,
+    "repetition_penalty": 1.15,
+    "no_repeat_ngram_size": 3,
+    "early_stopping": True
+}
+output_ids = model.generate(input_ids, **generation_config)
+response = tokenizer.decode(output_ids[0], skip_special_tokens=True)
+print("Model response:", response)
