@@ -1,0 +1,119 @@
+import openai
+import os
+from dotenv import load_dotenv
+from azure.identity import DefaultAzureCredential, get_bearer_token_provider
+
+# Load environment variables
+load_dotenv()
+
+def setup_azure_openai():
+    """Setup Azure OpenAI client with authentication"""
+    
+    # Method 1: Using API Key (simpler)
+    if os.getenv("AZURE_OPENAI_API_KEY"):
+        client = openai.AzureOpenAI(
+            api_version="2025-01-01-preview",
+            azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT", ""),
+            api_key=os.getenv("AZURE_OPENAI_API_KEY"),
+            azure_deployment=os.getenv("DEPLOYMENT_NAME", "gpt-4o"),
+        )
+        print("✅ Connected using API Key")
+        return client
+    
+    # Method 2: Using Azure Identity (from your original code)
+    else:
+        try:
+            default_credential = DefaultAzureCredential()
+            access_token = default_credential.get_token("https://cognitiveservices.azure.com/.default")
+            
+            # Set environment variables
+            os.environ["api_key"] = access_token.token
+            os.environ["AZURE_OPENAI_API_KEY"] = access_token.token
+            
+            client = openai.AzureOpenAI(
+                api_version="2025-01-01-preview",
+                azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT", ""),
+                api_key=access_token.token,
+                azure_deployment=os.getenv("DEPLOYMENT_NAME", "gpt-4o"),
+            )
+            print("✅ Connected using Azure Identity")
+            return client
+        except Exception as e:
+            print(f"❌ Error with Azure Identity: {e}")
+            return None
+
+def chat_with_model(client, message, conversation_history=None):
+    """Send a message to the model and get response"""
+    if conversation_history is None:
+        conversation_history = []
+    
+    # Add user message to history
+    conversation_history.append({"role": "user", "content": message})
+    
+    try:
+        response = client.chat.completions.create(
+            model=os.getenv("DEPLOYMENT_NAME", "gpt-4o"),
+            messages=conversation_history,
+            max_tokens=500,
+            temperature=0.7
+        )
+        
+        # Get the assistant's response
+        assistant_message = response.choices[0].message.content
+        
+        # Add assistant response to history
+        conversation_history.append({"role": "assistant", "content": assistant_message})
+        
+        return assistant_message, conversation_history
+        
+    except Exception as e:
+        return f"Error: {str(e)}", conversation_history
+
+def main():
+    """Main chat application"""
+    print("🤖 Simple Azure OpenAI Chat App")
+    print("=" * 40)
+    
+    # Setup client
+    client = setup_azure_openai()
+    if not client:
+        print("❌ Failed to setup Azure OpenAI client. Please check your credentials.")
+        return
+    
+    # Initialize conversation
+    conversation_history = [
+        {"role": "system", "content": "You are a helpful assistant. Keep responses concise and friendly."}
+    ]
+    
+    print("\n💬 Chat started! Type 'quit', 'exit', or 'bye' to end the conversation.")
+    print("=" * 40)
+    
+    while True:
+        # Get user input
+        user_input = input("\nYou: ").strip()
+        
+        # Check for exit commands
+        if user_input.lower() in ['quit', 'exit', 'bye', 'q']:
+            print("\n👋 Thanks for chatting! Goodbye!")
+            break
+        
+        if not user_input:
+            continue
+        
+        # Get response from model
+        print("\n🤖 Assistant: ", end="", flush=True)
+        response, conversation_history = chat_with_model(client, user_input, conversation_history)
+        print(response)
+
+if __name__ == "__main__":
+    # Set your credentials here or in a .env file
+    print("📋 Please set your Azure OpenAI credentials:")
+    print("Option 1 - Set environment variables:")
+    print("  AZURE_OPENAI_ENDPOINT=your_endpoint")
+    print("  AZURE_OPENAI_API_KEY=your_api_key") 
+    print("  DEPLOYMENT_NAME=your_deployment_name")
+    print("\nOption 2 - Create a .env file with the above variables")
+    print("\nOption 3 - Use Azure Identity (if configured)")
+    print("=" * 50)
+    
+    main()
