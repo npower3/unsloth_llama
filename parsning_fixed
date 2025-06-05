@@ -1,0 +1,246 @@
+import re
+from datetime import datetime
+
+class FixedWidthParser:
+    def __init__(self):
+        # Header Record Format (starts with 'H')
+        self.header_format = [
+            ('Transaction_Type', 1, 1, 'Alpha'),
+            ('Customer_Name', 2, 41, 'Alpha'),
+            ('HIPAA_Sender_ID', 42, 56, 'Alpha'),
+            ('HIPAA_ID_Qualifier', 57, 58, 'Alpha'),
+            ('Full_Trans_Indicator', 59, 62, 'Alpha'),
+            ('Prod_Test_Indicator', 63, 66, 'Alpha'),
+            ('File_Date', 67, 74, 'Numeric'),
+            ('Reserved', 75, 84, 'Alpha'),
+            ('Filler', 85, 400, 'Alpha')
+        ]
+        
+        # Detail Record Format (starts with 'D' or 'V')
+        self.detail_format = [
+            ('Transaction_Type', 1, 1, 'Alpha'),
+            ('Employer_Group_ID', 2, 21, 'Char'),
+            ('Employer_Group_Name', 22, 61, 'Alpha'),
+            ('Employer_Group_Eff_Date', 62, 69, 'Numeric'),
+            ('Employer_Group_Term_Date', 70, 77, 'Numeric'),
+            ('Situs_State', 78, 79, 'Alpha'),
+            ('Subgroup_Id', 80, 99, 'Char'),
+            ('Subgroup_Name', 100, 139, 'Alpha'),
+            ('Subgroup_Eff_Date', 140, 147, 'Numeric'),
+            ('Subgroup_Term_Date', 148, 155, 'Numeric'),
+            ('Benefit_Plan_ID', 156, 175, 'Char'),
+            ('Benefit_Plan_Name', 176, 215, 'Alpha'),
+            ('Benefit_Plan_Eff_Date', 216, 223, 'Numeric'),
+            ('Benefit_Plan_Term_Date', 224, 231, 'Numeric'),
+            ('Benefit_Year_Indicator', 232, 232, 'Numeric'),
+            ('HSA_HRA_Indicator', 233, 233, 'Numeric'),
+            ('Product_Type_Indicator', 234, 234, 'Numeric'),
+            ('Funding_Type_Indicator', 235, 235, 'Numeric'),
+            ('Subgroup_Type_Indicator', 236, 236, 'Numeric'),
+            ('Carryover_Indicator', 237, 237, 'Numeric'),
+            ('Carryover_Months', 238, 239, 'Numeric'),
+            ('Non_Network_Percent', 240, 242, 'Numeric'),
+            ('Benefit_Year_Renewal_Begin_Date', 243, 250, 'Numeric'),
+            ('Benefit_Year_End_Date', 251, 258, 'Numeric'),
+            ('Twelve_Month_Benefit_Indicator', 259, 259, 'Numeric'),
+            ('Non_Embedded_HDHP_Indicator', 260, 260, 'Numeric'),
+            ('Reserved_Group_Warning', 261, 261, 'Numeric'),
+            ('Health_Plan_Funding_Relationship', 262, 262, 'Numeric'),
+            ('Tenancy', 263, 292, 'Alpha'),
+            ('Branding', 293, 312, 'Alpha'),
+            ('Filler', 313, 400, 'Alpha')
+        ]
+        
+        # Trailer Record Format (starts with 'T')
+        self.trailer_format = [
+            ('Transaction_Type', 1, 1, 'Alpha'),
+            ('Record_Count', 2, 7, 'Numeric')
+        ]
+    
+    def parse_line(self, line, format_spec):
+        """Parse a single line based on format specification"""
+        parsed_data = {}
+        
+        for field_name, start_pos, end_pos, data_type in format_spec:
+            # Convert to 0-based indexing
+            start_idx = start_pos - 1
+            end_idx = end_pos
+            
+            # Extract field value
+            if end_idx <= len(line):
+                field_value = line[start_idx:end_idx].strip()
+            else:
+                field_value = line[start_idx:].strip() if start_idx < len(line) else ''
+            
+            # Convert based on data type
+            if data_type == 'Numeric' and field_value:
+                try:
+                    # Handle date formats (CCYYMMDD)
+                    if len(field_value) == 8 and field_value.isdigit():
+                        parsed_data[field_name] = self.format_date(field_value)
+                    else:
+                        parsed_data[field_name] = int(field_value) if field_value.isdigit() else field_value
+                except ValueError:
+                    parsed_data[field_name] = field_value
+            else:
+                parsed_data[field_name] = field_value
+        
+        return parsed_data
+    
+    def format_date(self, date_str):
+        """Format CCYYMMDD date string"""
+        if len(date_str) == 8 and date_str.isdigit():
+            try:
+                year = int(date_str[:4])
+                month = int(date_str[4:6])
+                day = int(date_str[6:8])
+                return f"{year}-{month:02d}-{day:02d}"
+            except ValueError:
+                return date_str
+        return date_str
+    
+    def parse_file(self, file_path):
+        """Parse the entire fixed-width file"""
+        results = {
+            'header': None,
+            'details': [],
+            'trailer': None
+        }
+        
+        try:
+            with open(file_path, 'r', encoding='utf-8') as file:
+                for line_num, line in enumerate(file, 1):
+                    line = line.rstrip('\n\r')
+                    
+                    if not line:  # Skip empty lines
+                        continue
+                    
+                    # Determine record type based on first character
+                    record_type = line[0].upper() if line else ''
+                    
+                    if record_type == 'H':
+                        # Header record
+                        results['header'] = self.parse_line(line, self.header_format)
+                        results['header']['line_number'] = line_num
+                        
+                    elif record_type in ['D', 'V']:
+                        # Detail record
+                        detail_record = self.parse_line(line, self.detail_format)
+                        detail_record['line_number'] = line_num
+                        results['details'].append(detail_record)
+                        
+                    elif record_type == 'T':
+                        # Trailer record
+                        results['trailer'] = self.parse_line(line, self.trailer_format)
+                        results['trailer']['line_number'] = line_num
+                        
+                    else:
+                        print(f"Warning: Unknown record type '{record_type}' at line {line_num}")
+        
+        except FileNotFoundError:
+            print(f"Error: File '{file_path}' not found")
+        except Exception as e:
+            print(f"Error reading file: {e}")
+        
+        return results
+    
+    def display_results(self, results):
+        """Display parsed results in a readable format"""
+        print("=" * 80)
+        print("FIXED WIDTH FILE PARSING RESULTS")
+        print("=" * 80)
+        
+        # Display Header
+        if results['header']:
+            print("\n📋 HEADER RECORD:")
+            print("-" * 40)
+            for key, value in results['header'].items():
+                if key != 'line_number':
+                    print(f"  {key}: {value}")
+            print(f"  Line Number: {results['header']['line_number']}")
+        
+        # Display Details
+        if results['details']:
+            print(f"\n📊 DETAIL RECORDS ({len(results['details'])} records):")
+            print("-" * 40)
+            for i, detail in enumerate(results['details'], 1):
+                print(f"\n  Detail Record #{i} (Line {detail['line_number']}):")
+                for key, value in detail.items():
+                    if key != 'line_number' and value:  # Only show non-empty fields
+                        print(f"    {key}: {value}")
+        
+        # Display Trailer
+        if results['trailer']:
+            print(f"\n🏁 TRAILER RECORD:")
+            print("-" * 40)
+            for key, value in results['trailer'].items():
+                if key != 'line_number':
+                    print(f"  {key}: {value}")
+            print(f"  Line Number: {results['trailer']['line_number']}")
+        
+        # Summary
+        print(f"\n📈 SUMMARY:")
+        print("-" * 40)
+        print(f"  Header Records: {1 if results['header'] else 0}")
+        print(f"  Detail Records: {len(results['details'])}")
+        print(f"  Trailer Records: {1 if results['trailer'] else 0}")
+        print(f"  Total Records: {(1 if results['header'] else 0) + len(results['details']) + (1 if results['trailer'] else 0)}")
+
+
+# Usage Example
+if __name__ == "__main__":
+    parser = FixedWidthParser()
+    
+    # Example usage - replace 'your_file.txt' with your actual file path
+    file_path = 'your_file.txt'
+    
+    # Parse the file
+    results = parser.parse_file(file_path)
+    
+    # Display results
+    parser.display_results(results)
+    
+    # You can also access individual parts:
+    print("\n" + "="*50)
+    print("ACCESSING INDIVIDUAL COMPONENTS:")
+    print("="*50)
+    
+    # Access header data
+    if results['header']:
+        print(f"Customer Name: {results['header'].get('Customer_Name', 'N/A')}")
+        print(f"File Date: {results['header'].get('File_Date', 'N/A')}")
+    
+    # Access detail records
+    for i, detail in enumerate(results['details']):
+        print(f"\nDetail {i+1}:")
+        print(f"  Employer Group: {detail.get('Employer_Group_Name', 'N/A')}")
+        print(f"  Benefit Plan: {detail.get('Benefit_Plan_Name', 'N/A')}")
+    
+    # Access trailer data
+    if results['trailer']:
+        print(f"\nTotal Records in File: {results['trailer'].get('Record_Count', 'N/A')}")
+
+    # Export to CSV (optional)
+    def export_to_csv(results, output_file='parsed_data.csv'):
+        """Export parsed data to CSV"""
+        import csv
+        
+        if not results['details']:
+            print("No detail records to export")
+            return
+        
+        # Get all unique field names from detail records
+        all_fields = set()
+        for detail in results['details']:
+            all_fields.update(detail.keys())
+        all_fields = sorted(list(all_fields))
+        
+        with open(output_file, 'w', newline='', encoding='utf-8') as csvfile:
+            writer = csv.DictWriter(csvfile, fieldnames=all_fields)
+            writer.writeheader()
+            writer.writerows(results['details'])
+        
+        print(f"Detail records exported to {output_file}")
+    
+    # Uncomment the line below to export to CSV
+    # export_to_csv(results)
