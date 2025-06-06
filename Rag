@@ -1,0 +1,350 @@
+import os
+import json
+from typing import List, Dict, Any
+import pandas as pd
+from openai import AzureOpenAI
+import tiktoken
+from dataclasses import dataclass
+import logging
+
+# Document processing libraries
+import PyPDF2
+import docx
+from pathlib import Path
+
+@dataclass
+class DocumentChunk:
+    content: str
+    metadata: Dict[str, Any]
+    chunk_id: int
+
+class DocumentQAAgent:
+    def __init__(
+        self,
+        azure_endpoint: str,
+        api_key: str,
+        api_version: str = "2024-02-15-preview",
+        deployment_name: str = "gpt-4",
+        max_tokens_per_chunk: int = 1500,
+        chunk_overlap: int = 200
+    ):
+        """
+        Initialize the Document Q&A Agent
+        
+        Args:
+            azure_endpoint: Your Azure OpenAI endpoint
+            api_key: Your Azure OpenAI API key
+            api_version: API version
+            deployment_name: Your GPT-4 deployment name
+            max_tokens_per_chunk: Maximum tokens per document chunk
+            chunk_overlap: Overlap between chunks in tokens
+        """
+        self.client = AzureOpenAI(
+            azure_endpoint=azure_endpoint,
+            api_key=api_key,
+            api_version=api_version
+        )
+        self.deployment_name = deployment_name
+        self.max_tokens_per_chunk = max_tokens_per_chunk
+        self.chunk_overlap = chunk_overlap
+        self.encoding = tiktoken.encoding_for_model("gpt-4")
+        self.document_chunks: List[DocumentChunk] = []
+        self.document_metadata = {}
+        
+        # Setup logging
+        logging.basicConfig(level=logging.INFO)
+        self.logger = logging.getLogger(__name__)
+
+    def read_pdf(self, file_path: str) -> str:
+        """Extract text from PDF file"""
+        text = ""
+        try:
+            with open(file_path, 'rb') as file:
+                pdf_reader = PyPDF2.PdfReader(file)
+                for page in pdf_reader.pages:
+                    text += page.extract_text() + "\n"
+        except Exception as e:
+            self.logger.error(f"Error reading PDF {file_path}: {e}")
+            raise
+        return text
+
+    def read_docx(self, file_path: str) -> str:
+        """Extract text from DOCX file"""
+        try:
+            doc = docx.Document(file_path)
+            text = ""
+            for paragraph in doc.paragraphs:
+                text += paragraph.text + "\n"
+        except Exception as e:
+            self.logger.error(f"Error reading DOCX {file_path}: {e}")
+            raise
+        return text
+
+    def read_txt(self, file_path: str) -> str:
+        """Read text file"""
+        try:
+            with open(file_path, 'r', encoding='utf-8') as file:
+                return file.read()
+        except Exception as e:
+            self.logger.error(f"Error reading TXT {file_path}: {e}")
+            raise
+
+    def load_document(self, file_path: str) -> str:
+        """Load document based on file extension"""
+        file_path = Path(file_path)
+        extension = file_path.suffix.lower()
+        
+        if extension == '.pdf':
+            content = self.read_pdf(str(file_path))
+        elif extension == '.docx':
+            content = self.read_docx(str(file_path))
+        elif extension == '.txt':
+            content = self.read_txt(str(file_path))
+        else:
+            raise ValueError(f"Unsupported file format: {extension}")
+        
+        self.document_metadata = {
+            'filename': file_path.name,
+            'file_path': str(file_path),
+            'file_size': file_path.stat().st_size,
+            'extension': extension
+        }
+        
+        return content
+
+    def chunk_text(self, text: str) -> List[DocumentChunk]:
+        """Split text into overlapping chunks"""
+        tokens = self.encoding.encode(text)
+        chunks = []
+        
+        start_idx = 0
+        chunk_id = 0
+        
+        while start_idx < len(tokens):
+            # Calculate end index for this chunk
+            end_idx = min(start_idx + self.max_tokens_per_chunk, len(tokens))
+            
+            # Get chunk tokens and decode back to text
+            chunk_tokens = tokens[start_idx:end_idx]
+            chunk_text = self.encoding.decode(chunk_tokens)
+            
+            # Create chunk with metadata
+            chunk = DocumentChunk(
+                content=chunk_text,
+                metadata={
+                    'chunk_id': chunk_id,
+                    'start_token': start_idx,
+                    'end_token': end_idx,
+                    'token_count': len(chunk_tokens),
+                    **self.document_metadata
+                },
+                chunk_id=chunk_id
+            )
+            
+            chunks.append(chunk)
+            chunk_id += 1
+            
+            # Move start index with overlap
+            start_idx = end_idx - self.chunk_overlap
+            
+            # Break if we're at the end
+            if end_idx >= len(tokens):
+                break
+        
+        return chunks
+
+    def process_document(self, file_path: str):
+        """Process document: load, chunk, and store"""
+        self.logger.info(f"Processing document: {file_path}")
+        
+        # Load document content
+        content = self.load_document(file_path)
+        
+        # Split into chunks
+        self.document_chunks = self.chunk_text(content)
+        
+        self.logger.info(f"Document processed into {len(self.document_chunks)} chunks")
+
+    def find_relevant_chunks(self, question: str, top_k: int = 3) -> List[DocumentChunk]:
+        """
+        Find most relevant chunks for the question using GPT-4 scoring
+        In a production system, you'd want to use embeddings for better performance
+        """
+        if not self.document_chunks:
+            return []
+        
+        scored_chunks = []
+        
+        for chunk in self.document_chunks:
+            # Use GPT-4 to score relevance (simple approach)
+            try:
+                response = self.client.chat.completions.create(
+                    model=self.deployment_name,
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": "Rate how relevant the following text chunk is to answering the given question. Respond with only a number from 0-10, where 10 is highly relevant and 0 is not relevant at all."
+                        },
+                        {
+                            "role": "user",
+                            "content": f"Question: {question}\n\nText chunk: {chunk.content[:500]}..."
+                        }
+                    ],
+                    max_tokens=10,
+                    temperature=0
+                )
+                
+                score = float(response.choices[0].message.content.strip())
+                scored_chunks.append((chunk, score))
+                
+            except Exception as e:
+                self.logger.warning(f"Error scoring chunk {chunk.chunk_id}: {e}")
+                scored_chunks.append((chunk, 0))
+        
+        # Sort by score and return top k
+        scored_chunks.sort(key=lambda x: x[1], reverse=True)
+        return [chunk for chunk, score in scored_chunks[:top_k]]
+
+    def answer_question(self, question: str, include_sources: bool = True) -> Dict[str, Any]:
+        """Answer question based on document content"""
+        if not self.document_chunks:
+            return {
+                "answer": "No document has been processed. Please load a document first.",
+                "sources": [],
+                "confidence": 0
+            }
+        
+        # Find relevant chunks
+        relevant_chunks = self.find_relevant_chunks(question, top_k=3)
+        
+        if not relevant_chunks:
+            return {
+                "answer": "I couldn't find relevant information in the document to answer your question.",
+                "sources": [],
+                "confidence": 0
+            }
+        
+        # Prepare context from relevant chunks
+        context = "\n\n".join([f"Chunk {chunk.chunk_id}:\n{chunk.content}" for chunk in relevant_chunks])
+        
+        # Generate answer using GPT-4
+        try:
+            response = self.client.chat.completions.create(
+                model=self.deployment_name,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": """You are a helpful assistant that answers questions based on provided document content. 
+                        Use only the information from the provided context to answer questions. 
+                        If the context doesn't contain enough information to answer the question, say so clearly.
+                        Be precise and cite specific parts of the text when possible."""
+                    },
+                    {
+                        "role": "user",
+                        "content": f"""Context from document:
+{context}
+
+Question: {question}
+
+Please provide a comprehensive answer based on the context above."""
+                    }
+                ],
+                max_tokens=1000,
+                temperature=0.3
+            )
+            
+            answer = response.choices[0].message.content.strip()
+            
+            # Prepare sources information
+            sources = []
+            if include_sources:
+                for chunk in relevant_chunks:
+                    sources.append({
+                        "chunk_id": chunk.chunk_id,
+                        "content_preview": chunk.content[:200] + "...",
+                        "metadata": chunk.metadata
+                    })
+            
+            return {
+                "answer": answer,
+                "sources": sources,
+                "confidence": len(relevant_chunks) / len(self.document_chunks) * 100
+            }
+            
+        except Exception as e:
+            self.logger.error(f"Error generating answer: {e}")
+            return {
+                "answer": f"Error generating answer: {e}",
+                "sources": [],
+                "confidence": 0
+            }
+
+    def get_document_summary(self) -> str:
+        """Get a summary of the loaded document"""
+        if not self.document_chunks:
+            return "No document loaded"
+        
+        # Use first few chunks for summary
+        sample_content = "\n".join([chunk.content for chunk in self.document_chunks[:3]])
+        
+        try:
+            response = self.client.chat.completions.create(
+                model=self.deployment_name,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "Provide a concise summary of the following document content."
+                    },
+                    {
+                        "role": "user",
+                        "content": sample_content
+                    }
+                ],
+                max_tokens=300,
+                temperature=0.3
+            )
+            
+            return response.choices[0].message.content.strip()
+            
+        except Exception as e:
+            return f"Error generating summary: {e}"
+
+# Example usage
+def main():
+    # Initialize the agent
+    agent = DocumentQAAgent(
+        azure_endpoint="https://your-resource.openai.azure.com/",
+        api_key="your-api-key",
+        deployment_name="your-gpt4-deployment-name"
+    )
+    
+    # Process a document
+    try:
+        agent.process_document("path/to/your/document.pdf")
+        
+        # Get document summary
+        summary = agent.get_document_summary()
+        print(f"Document Summary: {summary}\n")
+        
+        # Interactive Q&A
+        while True:
+            question = input("\nEnter your question (or 'quit' to exit): ")
+            
+            if question.lower() == 'quit':
+                break
+            
+            result = agent.answer_question(question)
+            
+            print(f"\nAnswer: {result['answer']}")
+            print(f"Confidence: {result['confidence']:.1f}%")
+            
+            if result['sources']:
+                print(f"\nSources used:")
+                for i, source in enumerate(result['sources'], 1):
+                    print(f"  {i}. Chunk {source['chunk_id']}: {source['content_preview']}")
+    
+    except Exception as e:
+        print(f"Error: {e}")
+
+if __name__ == "__main__":
+    main()
