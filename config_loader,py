@@ -1,0 +1,164 @@
+# config_loader.py
+# Configuration management and loading utilities
+
+import pandas as pd
+import json
+from typing import List
+from pathlib import Path
+from dataclasses import dataclass
+
+@dataclass
+class FieldConfig:
+    """Field configuration"""
+    name: str
+    start_pos: int
+    end_pos: int
+    length: int
+    format_type: str
+    description: str = ""
+    decimal_places: int = 0
+    date_format: str = "CCYYMMDD"
+    strip_spaces: bool = True
+
+@dataclass
+class RecordConfig:
+    """Record configuration"""
+    record_type: str
+    identifier: str
+    fields: List[FieldConfig]
+
+class ConfigLoader:
+    """Load configuration from various sources"""
+    
+    @staticmethod
+    def from_csv(file_path: str) -> List[RecordConfig]:
+        """Load from CSV file"""
+        df = pd.read_csv(file_path)
+        
+        # Normalize column names
+        df.columns = df.columns.str.strip().str.lower().str.replace(' ', '_')
+        
+        # Map common column variations
+        column_map = {
+            'field_name': ['field_name', 'name', 'field'],
+            'start_position': ['start_position', 'start_pos', 'start'],
+            'end_position': ['end_position', 'end_pos', 'end'],
+            'length': ['length', 'len'],
+            'format': ['format', 'format_type', 'type'],
+            'record_type': ['record_type', 'rec_type'],
+            'identifier': ['identifier', 'id'],
+            'description': ['description', 'desc'],
+        }
+        
+        # Rename columns
+        for standard, variations in column_map.items():
+            for var in variations:
+                if var in df.columns:
+                    df = df.rename(columns={var: standard})
+                    break
+        
+        # Validate required columns
+        required = ['field_name', 'start_position', 'end_position', 'length', 'format', 'record_type', 'identifier']
+        missing = [col for col in required if col not in df.columns]
+        if missing:
+            raise ValueError(f"Missing required columns: {missing}")
+        
+        # Build configuration
+        records = []
+        for record_type, group in df.groupby('record_type'):
+            fields = []
+            identifier = group['identifier'].iloc[0]
+            
+            for _, row in group.iterrows():
+                field = FieldConfig(
+                    name=str(row['field_name']).strip(),
+                    start_pos=int(row['start_position']),
+                    end_pos=int(row['end_position']),
+                    length=int(row['length']),
+                    format_type=str(row['format']).strip(),
+                    description=str(row.get('description', '')),
+                    decimal_places=int(row.get('decimal_places', 0)),
+                    date_format=str(row.get('date_format', 'CCYYMMDD')),
+                    strip_spaces=bool(row.get('strip_spaces', True))
+                )
+                fields.append(field)
+            
+            records.append(RecordConfig(record_type, identifier, fields))
+        
+        return records
+    
+    @staticmethod
+    def from_excel(file_path: str, sheet_name: str = None) -> List[RecordConfig]:
+        """Load from Excel file"""
+        if sheet_name:
+            df = pd.read_excel(file_path, sheet_name=sheet_name)
+        else:
+            # Auto-detect sheet
+            excel_file = pd.ExcelFile(file_path)
+            config_sheets = [s for s in excel_file.sheet_names 
+                           if any(k in s.lower() for k in ['config', 'field', 'spec'])]
+            sheet_name = config_sheets[0] if config_sheets else 0
+            df = pd.read_excel(file_path, sheet_name=sheet_name)
+        
+        # Save as temp CSV and use CSV loader
+        temp_csv = file_path.replace('.xlsx', '_temp.csv')
+        df.to_csv(temp_csv, index=False)
+        
+        try:
+            result = ConfigLoader.from_csv(temp_csv)
+            Path(temp_csv).unlink()  # Clean up
+            return result
+        except Exception as e:
+            if Path(temp_csv).exists():
+                Path(temp_csv).unlink()
+            raise e
+    
+    @staticmethod
+    def from_json(file_path: str) -> List[RecordConfig]:
+        """Load from JSON file"""
+        with open(file_path, 'r') as f:
+            data = json.load(f)
+        
+        records = []
+        for record_data in data.get('records', []):
+            fields = []
+            for field_data in record_data['fields']:
+                field = FieldConfig(**field_data)
+                fields.append(field)
+            
+            record = RecordConfig(
+                record_type=record_data['type'],
+                identifier=record_data['identifier'],
+                fields=fields
+            )
+            records.append(record)
+        
+        return records
+
+def create_sample_config(output_file: str = "config.csv"):
+    """Create sample configuration file"""
+    sample_data = [
+        # Header record
+        ['Header', 'H', 'transaction_type', 1, 1, 1, 'Alpha 1', 'Transaction Type', 0, '', True],
+        ['Header', 'H', 'customer_name', 2, 41, 40, 'Alpha 40', 'Customer Name', 0, '', True],
+        ['Header', 'H', 'file_date', 67, 74, 8, 'Numeric 8', 'File Date', 0, 'CCYYMMDD', True],
+        
+        # Detail record
+        ['Detail', 'D', 'transaction_type', 1, 1, 1, 'Alpha 1', 'Transaction Type', 0, '', True],
+        ['Detail', 'D', 'group_id', 2, 21, 20, 'Alpha 20', 'Group ID', 0, '', True],
+        ['Detail', 'D', 'group_name', 22, 61, 40, 'Alpha 40', 'Group Name', 0, '', True],
+        ['Detail', 'D', 'amount', 100, 107, 8, 'Numeric 8', 'Amount', 2, '', True],
+        
+        # Trailer record
+        ['Trailer', 'T', 'transaction_type', 1, 1, 1, 'Alpha 1', 'Transaction Type', 0, '', True],
+        ['Trailer', 'T', 'record_count', 2, 7, 6, 'Numeric 6', 'Record Count', 0, '', True],
+    ]
+    
+    columns = [
+        'record_type', 'identifier', 'field_name', 'start_position', 'end_position',
+        'length', 'format', 'description', 'decimal_places', 'date_format', 'strip_spaces'
+    ]
+    
+    df = pd.DataFrame(sample_data, columns=columns)
+    df.to_csv(output_file, index=False)
+    print(f"Sample configuration created: {output_file}")
