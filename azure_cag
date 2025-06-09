@@ -1,0 +1,78 @@
+import os
+from docx import Document
+from openai import AzureOpenAI
+
+# -------------------------------
+# 1. Read the .docx file content
+# -------------------------------
+def read_docx(file_path):
+    doc = Document(file_path)
+    full_text = []
+    for para in doc.paragraphs:
+        if para.text.strip():
+            full_text.append(para.text.strip())
+    return "\n".join(full_text)
+
+# -------------------------------
+# 2. Build the prompt/messages
+# -------------------------------
+def build_messages(reference_text, user_question):
+    system_prompt = (
+        "You are an expert assistant. Use ONLY the following reference material to answer the user's question.\n\n"
+        f"Reference Material:\n{reference_text}\n"
+    )
+    return [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_question}
+    ]
+
+# -------------------------------
+# 3. Ask question using Azure OpenAI
+# -------------------------------
+def ask_question(client, deployment, reference_text, question):
+    messages = build_messages(reference_text, question)
+    completion = client.chat.completions.create(
+        model=deployment,
+        messages=messages,
+        max_tokens=512,  # Adjust as needed
+        temperature=0.05,
+        top_p=1,
+        frequency_penalty=0,
+        presence_penalty=0,
+        stop=None,
+        stream=False
+    )
+    return completion.choices[0].message.content.strip()
+
+# -------------------------------
+# 4. Main execution
+# -------------------------------
+if __name__ == "__main__":
+    # Set your Azure OpenAI credentials and deployment details
+    endpoint = os.getenv("ENDPOINT_URL", "YOUR_ENDPOINT_URL")
+    deployment = os.getenv("DEPLOYMENT_NAME", "YOUR_DEPLOYMENT_NAME")
+    subscription_key = os.getenv("AZURE_OPENAI_API_KEY", "YOUR_AZURE_OPENAI_API_KEY")
+
+    # Initialize client
+    client = AzureOpenAI(
+        azure_endpoint=endpoint,
+        api_key=subscription_key,
+        api_version="2025-01-01-preview"
+    )
+
+    # Path to your .docx file
+    docx_path = "your_doc_file.docx"  # <-- Replace with your file path
+    if not os.path.exists(docx_path):
+        print(f"File not found: {docx_path}")
+        exit(1)
+
+    # Read reference material from the docx file
+    reference_text = read_docx(docx_path)
+
+    # Get user question
+    print("Reference material loaded from:", docx_path)
+    question = input("Enter your question: ")
+
+    # Get answer from the model
+    answer = ask_question(client, deployment, reference_text, question)
+    print("\nAnswer:\n", answer)
