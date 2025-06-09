@@ -1,0 +1,206 @@
+# data_parser.py
+# Main data parsing functionality
+
+import pandas as pd
+from typing import Dict, List, Any, Optional, Union
+from datetime import datetime
+from pathlib import Path
+from abc import ABC, abstractmethod
+
+# Import configuration classes
+from config_loader import FieldConfig, RecordConfig, ConfigLoader
+
+# =============================================================================
+# Field Parsers
+# =============================================================================
+
+class FieldParser(ABC):
+    @abstractmethod
+    def parse(self, value: str) -> Any:
+        pass
+
+class AlphaParser(FieldParser):
+    def __init__(self, strip_spaces: bool = True):
+        self.strip_spaces = strip_spaces
+    
+    def parse(self, value: str) -> str:
+        return value.strip() if self.strip_spaces else value
+
+class NumericParser(FieldParser):
+    def __init__(self, decimal_places: int = 0):
+        self.decimal_places = decimal_places
+    
+    def parse(self, value: str) -> Union[int, float]:
+        clean_value = value.strip()
+        if not clean_value:
+            return 0
+        try:
+            if self.decimal_places > 0:
+                return int(clean_value) / (10 ** self.decimal_places)
+            return int(clean_value)
+        except ValueError:
+            return 0
+
+class DateParser(FieldParser):
+    def __init__(self, date_format: str = "CCYYMMDD"):
+        self.format_map = {
+            'CCYYMMDD': '%Y%m%d',
+            'YYYYMMDD': '%Y%m%d',
+            'MMDDYYYY': '%m%d%Y',
+            'DDMMYYYY': '%d%m%Y'
+        }
+        self.python_format = self.format_map.get(date_format, '%Y%m%d')
+    
+    def parse(self, value: str) -> Optional[datetime]:
+        clean_value = value.strip()
+        if not clean_value or clean_value == '0' * len(clean_value):
+            return None
+        try:
+            return datetime.strptime(clean_value, self.python_format)
+        except ValueError:
+            return None
+
+# Field parsers are now in this file
+
+# =============================================================================
+# Main Parser
+# =============================================================================
+
+class DataParser:
+    """Simple, configurable data parser"""
+    
+    def __init__(self, config_file: str):
+        self.config_file = config_file
+        self.records = self._load_config()
+        self.record_map = {r.identifier: r for r in self.records}
+    
+    def _load_config(self) -> List[RecordConfig]:
+        """Load configuration based on file extension"""
+        file_path = Path(self.config_file)
+        
+        if file_path.suffix.lower() == '.csv':
+            return ConfigLoader.from_csv(self.config_file)
+        elif file_path.suffix.lower() in ['.xlsx', '.xls']:
+            return ConfigLoader.from_excel(self.config_file)
+        elif file_path.suffix.lower() == '.json':
+            return ConfigLoader.from_json(self.config_file)
+        else:
+            raise ValueError(f"Unsupported config format: {file_path.suffix}")
+    
+    def _create_parser(self, field: FieldConfig) -> FieldParser:
+        """Create appropriate parser for field"""
+        format_lower = field.format_type.lower()
+        
+        if 'alpha' in format_lower or 'char' in format_lower:
+            return AlphaParser(field.strip_spaces)
+        elif 'numeric' in format_lower:
+            return NumericParser(field.decimal_places)
+        elif 'date' in format_lower or (format_lower == 'numeric 8' and 'date' in field.description.lower()):
+            return DateParser(field.date_format)
+        else:
+            return AlphaParser(field.strip_spaces)
+    
+    def _extract_field(self, line: str, field: FieldConfig) -> str:
+        """Extract field value from line"""
+        start_idx = field.start_pos - 1  # Convert to 0-based
+        end_idx = field.end_pos
+        
+        if len(line) < end_idx:
+            return line[start_idx:] if start_idx < len(line) else ""
+        return line[start_idx:end_idx]
+    
+    def _parse_line(self, line: str, record_config: RecordConfig) -> Dict[str, Any]:
+        """Parse a line according to record configuration"""
+        result = {'record_type': record_config.record_type}
+        
+        for field in record_config.fields:
+            try:
+                raw_value = self._extract_field(line, field)
+                parser = self._create_parser(field)
+                result[field.name] = parser.parse(raw_value)
+            except Exception as e:
+                print(f"Error parsing field {field.name}: {e}")
+                result[field.name] = None
+        
+        return result
+    
+    def _identify_record(self, line: str) -> Optional[RecordConfig]:
+        """Identify record type from line"""
+        if not line:
+            return None
+        
+        # Assume first character is identifier (can be configured)
+        identifier = line[0] if line else ""
+        return self.record_map.get(identifier)
+    
+    def parse_file(self, file_path: str) -> Dict[str, List[Dict]]:
+        """Parse entire file"""
+        results = {record.record_type: [] for record in self.records}
+        
+        with open(file_path, 'r', encoding='utf-8') as f:
+            for line_num, line in enumerate(f, 1):
+                line = line.rstrip('\n\r')
+                
+                record_config = self._identify_record(line)
+                if record_config:
+                    try:
+                        parsed = self._parse_line(line, record_config)
+                        parsed['line_number'] = line_num
+                        results[record_config.record_type].append(parsed)
+                    except Exception as e:
+                        print(f"Error on line {line_num}: {e}")
+                else:
+                    print(f"Unknown record type at line {line_num}: {line[:20]}...")
+        
+        return results
+    
+    def to_dataframes(self, parsed_data: Dict[str, List[Dict]]) -> Dict[str, pd.DataFrame]:
+        """Convert to pandas DataFrames"""
+        return {
+            record_type: pd.DataFrame(records) 
+            for record_type, records in parsed_data.items() 
+            if records
+        }
+    
+    def to_excel(self, parsed_data: Dict[str, List[Dict]], output_file: str):
+        """Export to Excel"""
+        dataframes = self.to_dataframes(parsed_data)
+        
+        with pd.ExcelWriter(output_file, engine='openpyxl') as writer:
+            for record_type, df in dataframes.items():
+                df.to_excel(writer, sheet_name=record_type, index=False)
+    
+    def summary(self, parsed_data: Dict[str, List[Dict]]) -> Dict[str, int]:
+        """Get summary statistics"""
+        return {record_type: len(records) for record_type, records in parsed_data.items()}
+
+# =============================================================================
+# Usage Example
+# =============================================================================
+
+def main():
+    """Simple usage example"""
+    
+    # Import here to avoid circular import
+    from config_loader import create_sample_config
+    
+    # Create sample configuration
+    create_sample_config("my_config.csv")
+    
+    # Initialize parser
+    parser = DataParser("my_config.csv")
+    
+    # Example usage
+    print("DataParser initialized successfully!")
+    print(f"Loaded {len(parser.records)} record types:")
+    for record in parser.records:
+        print(f"  - {record.record_type} (ID: {record.identifier}) - {len(record.fields)} fields")
+    
+    print("\nUsage:")
+    print("  data = parser.parse_file('your_data.txt')")
+    print("  summary = parser.summary(data)")
+    print("  parser.to_excel(data, 'output.xlsx')")
+    print("  dataframes = parser.to_dataframes(data)")
+
+if __name__ == "__main__":
+    main()
