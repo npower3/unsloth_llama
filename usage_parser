@@ -1,0 +1,18 @@
+# Method 1: Use both files together
+from config_loader import create_sample_config
+from data_parser import DataParser
+
+# Create config
+create_sample_config("my_fields.csv")
+
+# Parse data
+parser = DataParser("my_fields.csv")
+data = parser.parse_file("my_data.txt")
+parser.to_excel(data, "output.xlsx")
+
+
+# Method 2: Just use the main parser (it imports config_loader automatically)
+from data_parser import DataParser
+
+parser = DataParser("existing_config.csv")
+data = parser.parse_file("data.txt")
