@@ -1,624 +1,305 @@
-import openai
+import requests
 import json
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
-from matplotlib.patches import FancyBboxPatch, Circle
+from matplotlib.patches import FancyBboxPatch
 import numpy as np
-import re
-from typing import Dict, List, Any, Tuple
-import networkx as nx
-from matplotlib.widgets import Button
-import tkinter as tk
-from tkinter import scrolledtext, messagebox, ttk
-import threading
-import webbrowser
-import os
-import tempfile
 
-class DynamicFlowchartGenerator:
-    def __init__(self, api_key: str = None):
+class SimpleFlowchartGenerator:
+    def __init__(self, custom_gpt4_endpoint: str):
         """
-        Initialize the Dynamic Flowchart Generator
+        Simple flowchart generator using custom GPT-4 endpoint
         
         Args:
-            api_key (str): OpenAI API key for GPT-3
+            custom_gpt4_endpoint (str): Your custom GPT-4 API endpoint
         """
-        if api_key:
-            openai.api_key = api_key
-        else:
-            print("⚠️  No API key provided. Please set it using set_api_key() method")
-        
+        self.gpt4_endpoint = custom_gpt4_endpoint
         self.flowchart_data = None
-        self.fig = None
-        self.ax = None
-        self.graph = nx.DiGraph()
-        
-    def set_api_key(self, api_key: str):
-        """Set OpenAI API key"""
-        openai.api_key = api_key
-        
-    def convert_text_to_flowchart_data(self, text: str, process_name: str = "Business Process") -> Dict[str, Any]:
+    
+    def text_to_flowchart(self, business_rules_text: str, process_name: str = "Business Process"):
         """
-        Use GPT-3 to convert free text business rules to structured flowchart data
+        Convert business rules text to flowchart using GPT-4
         
         Args:
-            text (str): Business rules text
+            business_rules_text (str): The business rules text
             process_name (str): Name of the process
-            
-        Returns:
-            Dict: Structured flowchart data
         """
         
-        prompt = f"""
-        You are an expert business analyst. Convert the following business rules text into a structured JSON format for creating a flowchart.
-
-        IMPORTANT: Create a complete flowchart structure with the following exact format:
-
-        {{
-            "process_name": "{process_name}",
-            "nodes": [
-                {{
-                    "id": "unique_node_id",
-                    "type": "start|decision|process|end",
-                    "label": "Short node label",
-                    "description": "Detailed description",
-                    "position": [x, y]
-                }}
-            ],
-            "connections": [
-                {{
-                    "from": "source_node_id",
-                    "to": "target_node_id", 
-                    "label": "condition or action",
-                    "type": "yes|no|default"
-                }}
-            ]
-        }}
-
-        Rules for conversion:
-        1. Always start with a "start" node
-        2. Create "decision" nodes for any conditions, checks, validations, or if/then statements
-        3. Create "process" nodes for actions, assignments, calculations, or operations
-        4. Always end with "end" nodes for different outcomes
-        5. Extract ALL specific details like field names, values, conditions
-        6. Create separate paths for different outcomes (success, error, bypass, etc.)
-        7. Include exact filter conditions, status codes, and field assignments
-        8. Position nodes logically from top to bottom, left to right
-
-        Business Rules Text:
-        {text}
-
-        Return ONLY the JSON structure, no additional text.
-        """
+        # Step 1: Get structured data from GPT-4
+        flowchart_data = self._call_gpt4(business_rules_text, process_name)
         
+        # Step 2: Create and display flowchart
+        self._create_flowchart(flowchart_data)
+        
+        return flowchart_data
+    
+    def _call_gpt4(self, text: str, process_name: str) -> dict:
+        """Call custom GPT-4 endpoint to convert text to flowchart structure"""
+        
+        prompt = f"""Convert this business rules text to flowchart JSON format:
+
+REQUIRED JSON FORMAT:
+{{
+    "title": "{process_name}",
+    "nodes": [
+        {{"id": "start", "type": "start", "text": "Start", "x": 5, "y": 10}},
+        {{"id": "decision1", "type": "decision", "text": "Check condition?", "x": 5, "y": 8}},
+        {{"id": "process1", "type": "process", "text": "Do action", "x": 3, "y": 6}},
+        {{"id": "end1", "type": "end", "text": "End", "x": 3, "y": 4}}
+    ],
+    "connections": [
+        {{"from": "start", "to": "decision1"}},
+        {{"from": "decision1", "to": "process1", "label": "Yes"}},
+        {{"from": "decision1", "to": "end1", "label": "No"}}
+    ]
+}}
+
+RULES:
+- Extract ALL conditions as "decision" nodes
+- Extract ALL actions as "process" nodes  
+- Include exact field names, values, status codes
+- Create separate paths for different outcomes
+- Position nodes: x=1-9, y=1-10 (top to bottom)
+
+Business Rules Text:
+{text}
+
+Return ONLY valid JSON, no other text."""
+
         try:
-            response = openai.ChatCompletion.create(
-                model="gpt-3.5-turbo",  # Using GPT-3.5 which is more cost-effective
-                messages=[
-                    {
-                        "role": "system", 
-                        "content": "You are an expert at converting business rules to flowchart structures. Always return valid JSON."
-                    },
-                    {
-                        "role": "user", 
-                        "content": prompt
-                    }
-                ],
-                max_tokens=2000,
-                temperature=0.3
-            )
+            # Call your custom GPT-4 endpoint
+            payload = {
+                "prompt": prompt,
+                "max_tokens": 2000,
+                "temperature": 0.3
+            }
             
-            response_text = response.choices[0].message.content.strip()
+            response = requests.post(self.gpt4_endpoint, json=payload, timeout=30)
+            response.raise_for_status()
             
-            # Clean up response to extract JSON
-            if "```json" in response_text:
-                response_text = response_text.split("```json")[1].split("```")[0]
-            elif "```" in response_text:
-                response_text = response_text.split("```")[1].split("```")[0]
+            # Extract JSON from response
+            response_text = response.json().get('response', response.text)
+            
+            # Clean response to extract JSON
+            if '```json' in response_text:
+                json_text = response_text.split('```json')[1].split('```')[0]
+            elif '```' in response_text:
+                json_text = response_text.split('```')[1].split('```')[0]
+            else:
+                json_text = response_text
             
             # Parse JSON
-            flowchart_data = json.loads(response_text)
+            flowchart_data = json.loads(json_text.strip())
             
-            # Validate and fix structure if needed
-            flowchart_data = self._validate_and_fix_structure(flowchart_data)
+            # Validate structure
+            if 'nodes' not in flowchart_data:
+                flowchart_data['nodes'] = []
+            if 'connections' not in flowchart_data:
+                flowchart_data['connections'] = []
             
             return flowchart_data
             
-        except json.JSONDecodeError as e:
-            print(f"JSON parsing error: {e}")
-            print(f"Response was: {response_text}")
-            return self._create_fallback_structure(text, process_name)
-            
         except Exception as e:
-            print(f"GPT-3 API error: {e}")
-            return self._create_fallback_structure(text, process_name)
+            print(f"GPT-4 Error: {e}")
+            # Simple fallback
+            return self._create_simple_fallback(text, process_name)
     
-    def _validate_and_fix_structure(self, data: Dict) -> Dict:
-        """Validate and fix flowchart structure"""
+    def _create_simple_fallback(self, text: str, process_name: str) -> dict:
+        """Create simple flowchart when GPT-4 fails"""
         
-        # Ensure required keys exist
-        if "nodes" not in data:
-            data["nodes"] = []
-        if "connections" not in data:
-            data["connections"] = []
-        if "process_name" not in data:
-            data["process_name"] = "Business Process"
+        sentences = [s.strip() for s in text.split('.') if s.strip()]
         
-        # Auto-assign positions if missing
-        for i, node in enumerate(data["nodes"]):
-            if "position" not in node or not node["position"]:
-                node["position"] = [5, 10 - i * 1.5]
-            
-            # Ensure required node fields
-            if "id" not in node:
-                node["id"] = f"node_{i}"
-            if "type" not in node:
-                node["type"] = "process"
-            if "label" not in node:
-                node["label"] = f"Step {i+1}"
-            if "description" not in node:
-                node["description"] = node.get("label", "")
-        
-        return data
-    
-    def _create_fallback_structure(self, text: str, process_name: str) -> Dict:
-        """Create a basic flowchart structure when GPT-3 fails"""
-        
-        # Simple text analysis for fallback
-        sentences = text.split('.')
-        
-        nodes = [
-            {
-                "id": "start",
-                "type": "start", 
-                "label": "Start Process",
-                "description": f"Begin {process_name}",
-                "position": [5, 10]
-            }
-        ]
-        
+        nodes = [{"id": "start", "type": "start", "text": "Start", "x": 5, "y": 10}]
         connections = []
-        current_y = 8.5
-        prev_node = "start"
         
-        for i, sentence in enumerate(sentences[:5]):  # Limit to 5 sentences
-            if sentence.strip():
-                node_id = f"step_{i}"
-                
-                # Simple rule classification
-                if any(word in sentence.lower() for word in ['if', 'check', 'validate', 'when', '?']):
-                    node_type = "decision"
-                else:
-                    node_type = "process"
-                
-                nodes.append({
-                    "id": node_id,
-                    "type": node_type,
-                    "label": sentence.strip()[:50] + "..." if len(sentence.strip()) > 50 else sentence.strip(),
-                    "description": sentence.strip(),
-                    "position": [5, current_y]
-                })
-                
-                connections.append({
-                    "from": prev_node,
-                    "to": node_id,
-                    "label": "",
-                    "type": "default"
-                })
-                
-                prev_node = node_id
-                current_y -= 1.5
+        y_pos = 8
+        prev_id = "start"
         
-        # Add end node
-        nodes.append({
-            "id": "end",
-            "type": "end",
-            "label": "End Process", 
-            "description": f"Complete {process_name}",
-            "position": [5, current_y]
-        })
+        for i, sentence in enumerate(sentences[:5]):
+            node_id = f"step_{i}"
+            
+            # Simple classification
+            if any(word in sentence.lower() for word in ['if', 'check', 'validate', 'when']):
+                node_type = "decision"
+            else:
+                node_type = "process"
+            
+            nodes.append({
+                "id": node_id,
+                "type": node_type, 
+                "text": sentence[:60] + "..." if len(sentence) > 60 else sentence,
+                "x": 5,
+                "y": y_pos
+            })
+            
+            connections.append({"from": prev_id, "to": node_id})
+            prev_id = node_id
+            y_pos -= 1.5
         
-        connections.append({
-            "from": prev_node,
-            "to": "end",
-            "label": "",
-            "type": "default"
-        })
+        nodes.append({"id": "end", "type": "end", "text": "End", "x": 5, "y": y_pos})
+        connections.append({"from": prev_id, "to": "end"})
         
         return {
-            "process_name": process_name,
+            "title": process_name,
             "nodes": nodes,
             "connections": connections
         }
     
-    def create_flowchart(self, flowchart_data: Dict, interactive: bool = True):
-        """
-        Create visual flowchart from structured data
+    def _create_flowchart(self, data: dict):
+        """Create visual flowchart from data"""
         
-        Args:
-            flowchart_data (Dict): Structured flowchart data
-            interactive (bool): Whether to make it interactive
-        """
+        fig, ax = plt.subplots(1, 1, figsize=(14, 10))
+        ax.set_xlim(0, 10)
+        ax.set_ylim(0, 11)
+        ax.axis('off')
         
-        self.flowchart_data = flowchart_data
-        
-        # Set up the plot
-        self.fig, self.ax = plt.subplots(1, 1, figsize=(16, 12))
-        self.ax.set_xlim(0, 10)
-        self.ax.set_ylim(0, 12)
-        self.ax.axis('off')
-        
-        # Colors for different node types
+        # Colors
         colors = {
-            'start': '#4CAF50',      # Green
-            'end': '#F44336',        # Red
-            'decision': '#2196F3',   # Blue  
-            'process': '#FF9800',    # Orange
-            'filter': '#9C27B0'      # Purple
+            'start': '#4CAF50',    # Green
+            'end': '#F44336',      # Red
+            'decision': '#2196F3', # Blue
+            'process': '#FF9800'   # Orange
         }
         
-        # Store node positions
-        node_positions = {}
-        
         # Draw nodes
-        for node in flowchart_data['nodes']:
-            x, y = node['position']
+        node_positions = {}
+        for node in data['nodes']:
+            x, y = node['x'], node['y']
             node_positions[node['id']] = (x, y)
-            
-            # Choose color
             color = colors.get(node['type'], '#CCCCCC')
             
-            # Draw node based on type
+            # Draw shape based on type
             if node['type'] == 'decision':
-                # Diamond for decisions
+                # Diamond
                 diamond = mpatches.RegularPolygon(
-                    (x, y), 4, radius=0.8, 
-                    orientation=np.pi/4,
-                    facecolor=color, 
-                    edgecolor='black', 
-                    linewidth=2,
-                    alpha=0.8
+                    (x, y), 4, radius=0.8, orientation=np.pi/4,
+                    facecolor=color, edgecolor='black', linewidth=2
                 )
-                self.ax.add_patch(diamond)
-                
+                ax.add_patch(diamond)
             elif node['type'] in ['start', 'end']:
-                # Oval for start/end
+                # Oval
                 ellipse = mpatches.Ellipse(
                     (x, y), 1.6, 0.8,
-                    facecolor=color,
-                    edgecolor='black',
-                    linewidth=2,
-                    alpha=0.8
+                    facecolor=color, edgecolor='black', linewidth=2
                 )
-                self.ax.add_patch(ellipse)
-                
+                ax.add_patch(ellipse)
             else:
-                # Rectangle for process
+                # Rectangle
                 rect = FancyBboxPatch(
                     (x-0.8, y-0.4), 1.6, 0.8,
                     boxstyle="round,pad=0.1",
-                    facecolor=color,
-                    edgecolor='black', 
-                    linewidth=2,
-                    alpha=0.8
+                    facecolor=color, edgecolor='black', linewidth=2
                 )
-                self.ax.add_patch(rect)
+                ax.add_patch(rect)
             
             # Add text
-            self.ax.text(
-                x, y, node['label'], 
-                ha='center', va='center',
-                fontsize=9, weight='bold',
-                wrap=True, color='white'
-            )
-            
-            # Add hover functionality if interactive
-            if interactive:
-                self._add_hover_effect(x, y, node)
+            ax.text(x, y, node['text'], ha='center', va='center',
+                   fontsize=9, weight='bold', wrap=True, color='white')
         
         # Draw connections
-        for conn in flowchart_data['connections']:
+        for conn in data['connections']:
             if conn['from'] in node_positions and conn['to'] in node_positions:
                 x1, y1 = node_positions[conn['from']]
                 x2, y2 = node_positions[conn['to']]
                 
-                # Draw arrow
-                self.ax.annotate(
-                    '', xy=(x2, y2), xytext=(x1, y1),
-                    arrowprops=dict(
-                        arrowstyle='->', 
-                        lw=2, 
-                        color='black',
-                        connectionstyle="arc3,rad=0.1"
-                    )
-                )
+                # Arrow
+                ax.annotate('', xy=(x2, y2), xytext=(x1, y1),
+                           arrowprops=dict(arrowstyle='->', lw=2, color='black'))
                 
-                # Add label if present
-                if conn.get('label'):
+                # Label
+                if 'label' in conn and conn['label']:
                     mid_x, mid_y = (x1 + x2) / 2, (y1 + y2) / 2
-                    label_color = 'green' if conn.get('type') == 'yes' else 'red' if conn.get('type') == 'no' else 'black'
-                    
-                    self.ax.text(
-                        mid_x + 0.3, mid_y, conn['label'],
-                        fontsize=8, weight='bold',
-                        bbox=dict(
-                            boxstyle="round,pad=0.2",
-                            facecolor='white',
-                            edgecolor=label_color,
-                            alpha=0.9
-                        ),
-                        color=label_color
-                    )
+                    ax.text(mid_x + 0.3, mid_y, conn['label'], fontsize=8, weight='bold',
+                           bbox=dict(boxstyle="round,pad=0.2", facecolor='white', alpha=0.8))
         
-        # Add title
-        self.ax.text(
-            5, 11.5, flowchart_data.get('process_name', 'Business Process Flowchart'),
-            ha='center', va='center', 
-            fontsize=16, weight='bold'
-        )
-        
-        # Add legend
-        legend_elements = [
-            mpatches.Patch(color=colors['start'], label='Start/End'),
-            mpatches.Patch(color=colors['decision'], label='Decision'),
-            mpatches.Patch(color=colors['process'], label='Process')
-        ]
-        self.ax.legend(handles=legend_elements, loc='upper right')
+        # Title
+        ax.text(5, 10.5, data.get('title', 'Business Process'), 
+               ha='center', va='center', fontsize=16, weight='bold')
         
         plt.tight_layout()
-        
-        if interactive:
-            # Add interactive buttons
-            self._add_interactive_buttons()
-        
         plt.show()
+        
+        # Save option
+        filename = f"{data.get('title', 'flowchart').replace(' ', '_')}.png"
+        fig.savefig(filename, dpi=300, bbox_inches='tight')
+        print(f"Flowchart saved as: {filename}")
+
+
+# Simple usage functions
+def generate_flowchart(text: str, gpt4_endpoint: str, process_name: str = "Business Process"):
+    """
+    Simple function to generate flowchart
     
-    def _add_hover_effect(self, x: float, y: float, node: Dict):
-        """Add hover effect to show node details"""
-        
-        def on_hover(event):
-            if event.inaxes == self.ax:
-                # Check if mouse is over this node
-                if abs(event.xdata - x) < 0.8 and abs(event.ydata - y) < 0.4:
-                    # Show tooltip
-                    tooltip_text = f"{node['label']}\n\n{node.get('description', '')}"
-                    self.ax.text(
-                        x, y-1, tooltip_text,
-                        ha='center', va='top',
-                        fontsize=8,
-                        bbox=dict(
-                            boxstyle="round,pad=0.5",
-                            facecolor='yellow',
-                            alpha=0.9
-                        )
-                    )
-                    self.fig.canvas.draw()
-        
-        self.fig.canvas.mpl_connect('motion_notify_event', on_hover)
-    
-    def _add_interactive_buttons(self):
-        """Add interactive buttons to the plot"""
-        
-        # Export button
-        ax_export = plt.axes([0.02, 0.02, 0.1, 0.04])
-        button_export = Button(ax_export, 'Export')
-        button_export.on_clicked(self._export_flowchart)
-        
-        # Regenerate button  
-        ax_regen = plt.axes([0.13, 0.02, 0.1, 0.04])
-        button_regen = Button(ax_regen, 'Regenerate')
-        button_regen.on_clicked(self._regenerate_layout)
-    
-    def _export_flowchart(self, event):
-        """Export flowchart to file"""
-        if self.fig:
-            filename = f"flowchart_{self.flowchart_data.get('process_name', 'process').replace(' ', '_')}.png"
-            self.fig.savefig(filename, dpi=300, bbox_inches='tight')
-            print(f"Flowchart exported as {filename}")
-    
-    def _regenerate_layout(self, event):
-        """Regenerate flowchart layout"""
-        if self.flowchart_data:
-            # Auto-arrange nodes using networkx
-            self._auto_arrange_nodes()
-            self.ax.clear()
-            self.create_flowchart(self.flowchart_data, interactive=True)
-    
-    def _auto_arrange_nodes(self):
-        """Automatically arrange nodes using graph layout"""
-        
-        # Build networkx graph
-        G = nx.DiGraph()
-        for node in self.flowchart_data['nodes']:
-            G.add_node(node['id'])
-        
-        for conn in self.flowchart_data['connections']:
-            G.add_edge(conn['from'], conn['to'])
-        
-        # Calculate layout
-        pos = nx.spring_layout(G, k=2, iterations=50)
-        
-        # Update node positions
-        for node in self.flowchart_data['nodes']:
-            if node['id'] in pos:
-                x, y = pos[node['id']]
-                # Scale and translate to fit our coordinate system
-                node['position'] = [x * 4 + 5, y * 6 + 6]
-    
-    def create_gui_interface(self):
-        """Create a GUI interface for easy use"""
-        
-        root = tk.Tk()
-        root.title("Dynamic Flowchart Generator")
-        root.geometry("800x600")
-        
-        # API Key input
-        api_frame = ttk.Frame(root, padding="10")
-        api_frame.grid(row=0, column=0, sticky=(tk.W, tk.E))
-        
-        ttk.Label(api_frame, text="OpenAI API Key:").grid(row=0, column=0, sticky=tk.W)
-        self.api_key_var = tk.StringVar()
-        api_entry = ttk.Entry(api_frame, textvariable=self.api_key_var, width=50, show="*")
-        api_entry.grid(row=0, column=1, padx=(10, 0))
-        
-        ttk.Button(api_frame, text="Set API Key", 
-                  command=self._set_api_key_from_gui).grid(row=0, column=2, padx=(10, 0))
-        
-        # Process name input
-        name_frame = ttk.Frame(root, padding="10")
-        name_frame.grid(row=1, column=0, sticky=(tk.W, tk.E))
-        
-        ttk.Label(name_frame, text="Process Name:").grid(row=0, column=0, sticky=tk.W)
-        self.process_name_var = tk.StringVar(value="Business Process")
-        ttk.Entry(name_frame, textvariable=self.process_name_var, width=50).grid(row=0, column=1, padx=(10, 0))
-        
-        # Text input area
-        text_frame = ttk.Frame(root, padding="10")
-        text_frame.grid(row=2, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
-        
-        ttk.Label(text_frame, text="Business Rules Text:").pack(anchor=tk.W)
-        
-        self.text_input = scrolledtext.ScrolledText(
-            text_frame, 
-            wrap=tk.WORD, 
-            width=90, 
-            height=20,
-            font=("Arial", 10)
-        )
-        self.text_input.pack(fill=tk.BOTH, expand=True, pady=(5, 0))
-        
-        # Default example text
-        example_text = """The transformation logic for grgr_sts is as follows:
-        
-1. Apply Group ID Filter: Check if HP Group ID matches any value in t_cbms_attribute where attribute_name='GROUP ID FILTER'. If matched, set transaction_status='256' and record_status='215', then bypass further processing.
+    Args:
+        text (str): Business rules text
+        gpt4_endpoint (str): Your custom GPT-4 endpoint URL
+        process_name (str): Name of the process
+    """
+    generator = SimpleFlowchartGenerator(gpt4_endpoint)
+    return generator.text_to_flowchart(text, process_name)
 
-2. Apply Benefit ID Filter: Check if HP Benefit ID matches any value in t_cbms_attribute where attribute_name='BENEFIT ID FILTER'. If matched, set transaction_status='256' and record_status='215', then bypass further processing.
-
-3. Validate Dates: Check if Employee Group Effective Date and Term Date are present and valid. If missing or invalid, set transaction_status='256' and record_status='216', then bypass further processing.
-
-4. Assign Field: If all validations pass, assign grgr_sts based on grgr_term_dt using GroupTermDate logic.
-
-5. Final Check: Verify all processing completed successfully. If any errors occurred, set grgr_sts to NULL."""
-        
-        self.text_input.insert(tk.END, example_text)
-        
-        # Buttons frame
-        button_frame = ttk.Frame(root, padding="10")
-        button_frame.grid(row=3, column=0)
-        
-        ttk.Button(button_frame, text="Generate Flowchart", 
-                  command=self._generate_from_gui).pack(side=tk.LEFT, padx=(0, 10))
-        
-        ttk.Button(button_frame, text="Clear Text", 
-                  command=self._clear_text).pack(side=tk.LEFT, padx=(0, 10))
-        
-        ttk.Button(button_frame, text="Load Example", 
-                  command=self._load_example).pack(side=tk.LEFT)
-        
-        # Status label
-        self.status_var = tk.StringVar(value="Ready. Enter your OpenAI API key and business rules text.")
-        status_label = ttk.Label(root, textvariable=self.status_var)
-        status_label.grid(row=4, column=0, pady=(5, 0))
-        
-        # Configure grid weights
-        root.columnconfigure(0, weight=1)
-        root.rowconfigure(2, weight=1)
-        text_frame.columnconfigure(0, weight=1)
-        text_frame.rowconfigure(1, weight=1)
-        
-        root.mainloop()
-    
-    def _set_api_key_from_gui(self):
-        """Set API key from GUI input"""
-        api_key = self.api_key_var.get().strip()
-        if api_key:
-            self.set_api_key(api_key)
-            self.status_var.set("API key set successfully!")
-        else:
-            messagebox.showerror("Error", "Please enter a valid API key")
-    
-    def _generate_from_gui(self):
-        """Generate flowchart from GUI input"""
-        
-        def generate_async():
-            try:
-                self.status_var.set("Generating flowchart... Please wait.")
-                
-                text = self.text_input.get(1.0, tk.END).strip()
-                process_name = self.process_name_var.get().strip()
-                
-                if not text:
-                    messagebox.showerror("Error", "Please enter business rules text")
-                    return
-                
-                if not openai.api_key:
-                    messagebox.showerror("Error", "Please set your OpenAI API key first")
-                    return
-                
-                # Generate flowchart data
-                flowchart_data = self.convert_text_to_flowchart_data(text, process_name)
-                
-                # Create flowchart
-                self.create_flowchart(flowchart_data, interactive=True)
-                
-                self.status_var.set("Flowchart generated successfully!")
-                
-            except Exception as e:
-                self.status_var.set(f"Error: {str(e)}")
-                messagebox.showerror("Error", f"Failed to generate flowchart: {str(e)}")
-        
-        # Run in separate thread to avoid blocking GUI
-        thread = threading.Thread(target=generate_async)
-        thread.daemon = True
-        thread.start()
-    
-    def _clear_text(self):
-        """Clear text input"""
-        self.text_input.delete(1.0, tk.END)
-        self.status_var.set("Text cleared. Enter new business rules.")
-    
-    def _load_example(self):
-        """Load example text"""
-        example = """Process customer order validation:
-
-1. Check if customer exists: Validate customer ID against customer database. If not found, create error record with status 'INVALID_CUSTOMER' and stop processing.
-
-2. Verify payment method: Check if payment method is valid and has sufficient funds. If payment fails, set order status to 'PAYMENT_FAILED' and send notification to customer.
-
-3. Check inventory: Verify product availability in inventory system. If insufficient stock, set status to 'OUT_OF_STOCK' and create backorder.
-
-4. Calculate shipping: Determine shipping cost based on customer location and product weight. If shipping address is invalid, mark as 'INVALID_ADDRESS'.
-
-5. Process order: If all validations pass, create order record with status 'CONFIRMED' and initiate fulfillment process.
-
-6. Send confirmation: Email order confirmation to customer with tracking information."""
-        
-        self.text_input.delete(1.0, tk.END)
-        self.text_input.insert(tk.END, example)
-        self.status_var.set("Example loaded. Click 'Generate Flowchart' to create visualization.")
-
-
-# Example usage functions
-def quick_generate(text: str, api_key: str, process_name: str = "Business Process"):
-    """Quick function to generate flowchart from text"""
-    
-    generator = DynamicFlowchartGenerator(api_key)
-    flowchart_data = generator.convert_text_to_flowchart_data(text, process_name)
-    generator.create_flowchart(flowchart_data, interactive=True)
-    return generator
-
-def launch_gui():
-    """Launch the GUI interface"""
-    generator = DynamicFlowchartGenerator()
-    generator.create_gui_interface()
 
 # Example usage
 if __name__ == "__main__":
-    print("Dynamic Flowchart Generator")
-    print("=" * 50)
-    print("Options:")
-    print("1. Launch GUI interface: launch_gui()")
-    print("2. Quick generate: quick_generate(text, api_key, process_name)")
-    print()
-    print("Launching GUI...")
-    launch_gui()
+    
+    # Your custom GPT-4 endpoint
+    CUSTOM_GPT4_ENDPOINT = "https://your-custom-gpt4-endpoint.com/api/generate"
+    
+    # Example business rules
+    business_rules = """
+    The transformation logic for grgr_sts is as follows:
+    
+    1. Apply Group ID Filter: Check if HP Group ID (GRGR ID) matches any value in t_cbms_attribute where attribute_name='GROUP ID FILTER'. If matched, set transaction_status='256' and record_status='215', insert minimal fields, and bypass further processing.
+    
+    2. Apply Benefit ID Filter: Check if HP Benefit ID (PDPD ID) matches any value in t_cbms_attribute where attribute_name='BENEFIT ID FILTER'. If matched, set transaction_status='256' and record_status='215', insert minimal fields, and bypass further processing.
+    
+    3. Validate Employee Group Dates: Check if Employee Group Effective Date and Term Date are present and valid. If dates are missing or invalid, set transaction_status='256' and record_status='216', set default values, and bypass further processing for errored records.
+    
+    4. Assign Field Logic: Assign grgr_sts based on grgr_term_dt using GroupTermDate logic. Apply TDD Section 3.3.2 Group File Layout and Mapping Requirements.
+    
+    5. Final Validation: Validate all filters and validation steps. If all passed, complete processing. If any failed, set grgr_sts = NULL for errored records.
+    """
+    
+    # Generate flowchart
+    print("Generating flowchart...")
+    
+    try:
+        flowchart_data = generate_flowchart(
+            text=business_rules,
+            gpt4_endpoint=CUSTOM_GPT4_ENDPOINT,
+            process_name="GRGR_STS Transformation Logic"
+        )
+        print("Flowchart generated successfully!")
+        print(f"Created {len(flowchart_data['nodes'])} nodes and {len(flowchart_data['connections'])} connections")
+        
+    except Exception as e:
+        print(f"Error: {e}")
+        print("Please check your GPT-4 endpoint and try again.")
+
+
+# Alternative: Direct usage with your endpoint
+def quick_flowchart(rules_text: str, endpoint_url: str):
+    """Ultra-simple one-liner flowchart generation"""
+    return SimpleFlowchartGenerator(endpoint_url).text_to_flowchart(rules_text)
+
+
+# Test with different endpoint formats
+def test_endpoint_formats():
+    """Test different ways to call your endpoint"""
+    
+    endpoints = [
+        "https://your-domain.com/gpt4/api",
+        "https://api.your-service.com/v1/generate",
+        "http://localhost:8000/gpt4"
+    ]
+    
+    sample_text = "Check if user exists. If yes, validate password. If valid, login. If not, show error."
+    
+    for endpoint in endpoints:
+        print(f"Testing endpoint: {endpoint}")
+        try:
+            quick_flowchart(sample_text, endpoint)
+            print("✅ Success!")
+            break
+        except Exception as e:
+            print(f"❌ Failed: {e}")
