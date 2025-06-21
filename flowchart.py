@@ -1,3 +1,4 @@
+pip install plotly networkx graphviz pandas numpy requests kaleido
 import requests
 import json
 import matplotlib.pyplot as plt
