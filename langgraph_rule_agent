@@ -1,0 +1,761 @@
+import json
+from datetime import datetime
+from typing import Dict, List, Any, Optional, TypedDict, Annotated
+from dataclasses import dataclass, asdict
+import logging
+import operator
+
+# LangGraph and LangChain imports
+from langgraph.graph import StateGraph, END
+from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, SystemMessage
+from langchain_core.tools import BaseTool
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_openai import ChatOpenAI
+from pydantic import BaseModel, Field
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Enhanced State Management
+class AgentState(TypedDict):
+    """Enhanced state that flows through the LangGraph workflow"""
+    messages: Annotated[List[BaseMessage], operator.add]
+    # TDD Processing
+    technical_design_doc: Optional[str]
+    crude_rule_definition: Optional[str]
+    generated_business_rule: Optional[str]
+    rule_generation_context: Optional[Dict[str, Any]]
+    # Validation Processing
+    input_record: Dict[str, Any]
+    business_rule: str
+    expected_output: Dict[str, Any]
+    actual_output: Optional[Dict[str, Any]]
+    validation_result: Optional[Dict[str, Any]]
+    correction_suggestion: Optional[Dict[str, Any]]
+    # Flow Control
+    next_action: str
+    validation_passed: bool
+    batch_data: Optional[List[Dict[str, Any]]]
+    error_message: Optional[str]
+    # Chain of Thought
+    reasoning_chain: List[str]
+
+@dataclass
+class ValidationResult:
+    """Enhanced result of rule validation"""
+    original_crude_rule: Optional[str]
+    generated_business_rule: str
+    input_record: Dict[str, Any]
+    expected_output: Dict[str, Any]
+    actual_output: Dict[str, Any]
+    passed: bool
+    differences: Dict[str, Any]
+    timestamp: datetime
+    confidence: float
+    reasoning_chain: List[str]
+
+# TDD Parser and Rule Generator Agent
+class TDDRuleGeneratorAgent:
+    """LLM-powered agent that converts crude TDD rule definitions into proper business rules"""
+    
+    def __init__(self, llm: ChatOpenAI):
+        self.llm = llm
+        self.rule_generation_prompt = ChatPromptTemplate.from_messages([
+            ("system", """You are an expert business analyst and rule interpreter. Your job is to:
+
+1. **Analyze Technical Design Documents (TDD)** and extract crude rule definitions
+2. **Understand the business intent** behind poorly written or incomplete rule specifications
+3. **Generate clear, executable business rules** from ambiguous technical specifications
+4. **Provide chain-of-thought reasoning** for your interpretation
+
+You excel at:
+- Converting technical jargon into business language
+- Filling gaps in incomplete rule definitions
+- Understanding field mappings and transformations
+- Interpreting conditional logic from crude descriptions
+- Handling edge cases and business context
+
+**CRITICAL**: Always provide a reasoning chain showing how you interpreted the crude definition.
+
+Return JSON with:
+{
+    "generated_business_rule": "clear, executable business rule in natural language",
+    "confidence": 0.95,
+    "reasoning_chain": [
+        "step 1: identified key fields and conditions",
+        "step 2: interpreted the business logic intent", 
+        "step 3: handled edge cases and assumptions",
+        "step 4: formulated final rule"
+    ],
+    "assumptions_made": ["list of assumptions from incomplete specs"],
+    "potential_ambiguities": ["areas that might need clarification"],
+    "context_extracted": {
+        "source_fields": ["field1", "field2"],
+        "target_fields": ["output1"],
+        "conditions": ["condition descriptions"],
+        "business_domain": "inferred domain context"
+    }
+}"""),
+            ("human", """**TECHNICAL DESIGN DOCUMENT ANALYSIS**
+
+Technical Design Document Content:
+{tdd_content}
+
+Crude Rule Definition:
+{crude_rule}
+
+Input Record Structure (for context):
+{input_structure}
+
+Expected Output Structure (for context):
+{output_structure}
+
+**TASK**: Convert this crude rule definition into a clear, executable business rule. Use the TDD content for additional context and business understanding. Think through your interpretation step by step.""")
+        ])
+    
+    def __call__(self, state: AgentState) -> AgentState:
+        """Generate business rule from crude TDD definition"""
+        logger.info("TDDRuleGeneratorAgent: Converting crude rule definition to business rule")
+        
+        try:
+            # Prepare context from state
+            tdd_content = state.get("technical_design_doc", "No TDD provided")
+            crude_rule = state.get("crude_rule_definition", "No crude rule provided")
+            input_structure = json.dumps(state["input_record"], indent=2)
+            output_structure = json.dumps(state["expected_output"], indent=2)
+            
+            # Generate business rule using LLM
+            prompt = self.rule_generation_prompt.format_messages(
+                tdd_content=tdd_content,
+                crude_rule=crude_rule,
+                input_structure=input_structure,
+                output_structure=output_structure
+            )
+            
+            response = self.llm.invoke(prompt)
+            
+            # Parse LLM response
+            content = response.content.strip()
+            
+            # Extract JSON
+            if '```json' in content:
+                json_start = content.find('```json') + 7
+                json_end = content.find('```', json_start)
+                content = content[json_start:json_end].strip()
+            elif '{' in content:
+                json_start = content.find('{')
+                brace_count = 0
+                json_end = json_start
+                for i, char in enumerate(content[json_start:], json_start):
+                    if char == '{':
+                        brace_count += 1
+                    elif char == '}':
+                        brace_count -= 1
+                        if brace_count == 0:
+                            json_end = i + 1
+                            break
+                content = content[json_start:json_end]
+            
+            generation_result = json.loads(content)
+            
+            # Update state with generated rule
+            state["generated_business_rule"] = generation_result["generated_business_rule"]
+            state["business_rule"] = generation_result["generated_business_rule"]  # Set for validation
+            state["rule_generation_context"] = generation_result
+            state["reasoning_chain"] = generation_result.get("reasoning_chain", [])
+            state["next_action"] = "validation"
+            
+            # Log the generation process
+            reasoning = generation_result.get("reasoning_chain", [])
+            assumptions = generation_result.get("assumptions_made", [])
+            
+            state["messages"].append(AIMessage(
+                content=f"""🧠 **BUSINESS RULE GENERATION COMPLETE**
+
+**Original Crude Rule**: {crude_rule}
+
+**Generated Business Rule**: {generation_result['generated_business_rule']}
+
+**Confidence**: {generation_result.get('confidence', 0.0):.1%}
+
+**Reasoning Chain**:
+{chr(10).join(f'{i+1}. {step}' for i, step in enumerate(reasoning))}
+
+**Assumptions Made**:
+{chr(10).join(f'• {assumption}' for assumption in assumptions)}
+
+**Context Extracted**:
+• Source Fields: {generation_result.get('context_extracted', {}).get('source_fields', [])}
+• Target Fields: {generation_result.get('context_extracted', {}).get('target_fields', [])}
+• Business Domain: {generation_result.get('context_extracted', {}).get('business_domain', 'Unknown')}
+
+Proceeding to validation..."""
+            ))
+            
+        except json.JSONDecodeError as e:
+            logger.error(f"Failed to parse rule generation result: {e}")
+            state["error_message"] = f"Rule generation parsing failed: {str(e)}"
+            state["next_action"] = "complete"
+            state["messages"].append(AIMessage(
+                content=f"❌ Failed to generate business rule from crude definition. Error: {str(e)}"
+            ))
+        except Exception as e:
+            logger.error(f"Rule generation error: {e}")
+            state["error_message"] = f"Rule generation failed: {str(e)}"
+            state["next_action"] = "complete"
+            state["messages"].append(AIMessage(
+                content=f"❌ Rule generation failed: {str(e)}"
+            ))
+        
+        return state
+
+# Enhanced LLM Rule Evaluator with TDD Context
+class LLMRuleEvaluatorTool(BaseTool):
+    """Enhanced LLM-powered tool that can reference TDD context during execution"""
+    name: str = "llm_rule_evaluator"
+    description: str = "Uses LLM to interpret and execute business rules with TDD context awareness"
+    
+    def __init__(self, llm: ChatOpenAI):
+        super().__init__()
+        self.llm = llm
+        self.rule_execution_prompt = ChatPromptTemplate.from_messages([
+            ("system", """You are an expert business rule execution engine with deep contextual understanding. Your job is to:
+
+1. **Execute business rules** with full contextual awareness
+2. **Reference TDD context** when available for better interpretation
+3. **Handle ambiguities** intelligently using business domain knowledge
+4. **Provide chain-of-thought reasoning** for your execution steps
+
+You excel at:
+- Understanding business rules in natural language
+- Applying complex conditional logic
+- Handling date comparisons and transformations
+- Managing field mappings and data transformations
+- Using contextual clues for edge case handling
+
+**CRITICAL**: Return ONLY valid JSON with the output fields and values.
+
+**Example Executions**:
+Rule: "If termination date is far future, set status to active, otherwise terminated"
+Input: {"term_date": "12/31/9999"}
+Reasoning: "Far future date (12/31/9999) indicates no real termination"
+Output: {"status": "active"}
+
+Rule: "Map employee status based on end date relative to today"
+Input: {"end_date": "2023-04-01"}
+Context: "Today is after 2023-04-01, so employee has ended"
+Output: {"employee_status": "terminated"}"""),
+            ("human", """**BUSINESS RULE EXECUTION**
+
+Business Rule: {rule}
+
+Input Record: {input_record}
+
+TDD Context (if available): {tdd_context}
+
+Generation Context: {generation_context}
+
+**TASK**: Execute this business rule against the input record. Think through the logic step by step, then provide ONLY the JSON output.""")
+        ])
+    
+    def _run(self, rule: str, input_record: Dict[str, Any], **kwargs) -> Dict[str, Any]:
+        """Execute business rule with enhanced context awareness"""
+        try:
+            # Get additional context
+            tdd_context = kwargs.get("tdd_context", "No TDD context available")
+            generation_context = kwargs.get("generation_context", {})
+            
+            # Format prompt with enhanced context
+            prompt = self.rule_execution_prompt.format_messages(
+                rule=rule,
+                input_record=json.dumps(input_record, indent=2),
+                tdd_context=str(tdd_context)[:1000],  # Limit context size
+                generation_context=json.dumps(generation_context, indent=2)[:1000]
+            )
+            
+            # Get LLM response
+            response = self.llm.invoke(prompt)
+            
+            # Extract JSON from response
+            content = response.content.strip()
+            
+            # Handle various response formats
+            if '```json' in content:
+                json_start = content.find('```json') + 7
+                json_end = content.find('```', json_start)
+                content = content[json_start:json_end].strip()
+            elif '{' in content and '}' in content:
+                # Find the first complete JSON object
+                json_start = content.find('{')
+                brace_count = 0
+                json_end = json_start
+                for i, char in enumerate(content[json_start:], json_start):
+                    if char == '{':
+                        brace_count += 1
+                    elif char == '}':
+                        brace_count -= 1
+                        if brace_count == 0:
+                            json_end = i + 1
+                            break
+                content = content[json_start:json_end]
+            
+            # Parse and validate JSON
+            result = json.loads(content)
+            logger.info(f"Rule executed successfully with context: {result}")
+            return result
+            
+        except json.JSONDecodeError as e:
+            logger.error(f"Failed to parse LLM response as JSON: {e}")
+            logger.error(f"Raw response: {response.content}")
+            return {"error": f"Failed to parse rule execution result: {str(e)}", "raw_response": response.content[:500]}
+        except Exception as e:
+            logger.error(f"Error in contextual rule execution: {e}")
+            return {"error": f"Rule execution failed: {str(e)}"}
+
+# Enhanced Validation Agent with TDD Context
+class LLMValidationAgent:
+    """Enhanced LLM-powered validation agent with TDD context awareness"""
+    
+    def __init__(self, llm: ChatOpenAI):
+        self.llm = llm
+        self.rule_evaluator = LLMRuleEvaluatorTool(llm)
+        self.comparison_engine = LLMComparisonTool(llm)
+    
+    def __call__(self, state: AgentState) -> AgentState:
+        """Execute validation with TDD context"""
+        logger.info("LLMValidationAgent: Starting contextual rule validation")
+        
+        try:
+            # Prepare context for rule execution
+            tdd_context = state.get("technical_design_doc", "")
+            generation_context = state.get("rule_generation_context", {})
+            
+            # Execute rule with enhanced context
+            rule_result = self.rule_evaluator._run(
+                rule=state["business_rule"],
+                input_record=state["input_record"],
+                tdd_context=tdd_context,
+                generation_context=generation_context
+            )
+            
+            if "error" in rule_result:
+                state["error_message"] = rule_result["error"]
+                state["next_action"] = "complete"
+                state["validation_passed"] = False
+                state["messages"].append(AIMessage(
+                    content=f"❌ Rule execution failed: {rule_result['error']}"
+                ))
+                return state
+            
+            state["actual_output"] = rule_result
+            
+            # Enhanced comparison with context
+            comparison_result = self.comparison_engine._run(
+                expected=state["expected_output"],
+                actual=rule_result
+            )
+            
+            # Create enhanced validation result
+            validation_result = ValidationResult(
+                original_crude_rule=state.get("crude_rule_definition"),
+                generated_business_rule=state["business_rule"],
+                input_record=state["input_record"],
+                expected_output=state["expected_output"],
+                actual_output=rule_result,
+                passed=comparison_result["passed"],
+                differences=comparison_result.get("differences", {}),
+                timestamp=datetime.now(),
+                confidence=comparison_result.get("confidence", 0.0),
+                reasoning_chain=state.get("reasoning_chain", [])
+            )
+            
+            state["validation_result"] = asdict(validation_result)
+            state["validation_passed"] = comparison_result["passed"]
+            
+            # Enhanced result messaging
+            if comparison_result["passed"]:
+                state["next_action"] = "complete"
+                state["messages"].append(AIMessage(
+                    content=f"""✅ **VALIDATION PASSED** (confidence: {comparison_result.get('confidence', 0.0):.1%})
+
+**Generated Rule**: {state['business_rule']}
+**Summary**: {comparison_result.get('summary', 'Outputs match expected results')}
+**Context-Aware Execution**: Successfully applied TDD context for accurate interpretation"""
+                ))
+            else:
+                state["next_action"] = "correction"
+                state["messages"].append(AIMessage(
+                    content=f"""❌ **VALIDATION FAILED** (confidence: {comparison_result.get('confidence', 0.0):.1%})
+
+**Generated Rule**: {state['business_rule']}
+**Summary**: {comparison_result.get('summary', 'Outputs do not match')}
+**Differences**: {comparison_result.get('differences', {})}
+
+Proceeding to intelligent correction analysis..."""
+                ))
+        
+        except Exception as e:
+            logger.error(f"Enhanced validation error: {e}")
+            state["error_message"] = str(e)
+            state["next_action"] = "complete"
+            state["validation_passed"] = False
+            state["messages"].append(AIMessage(content=f"❌ Validation failed with error: {str(e)}"))
+        
+        return state
+
+# Copy previous LLMComparisonTool and LLMCorrectionAgent here
+class LLMComparisonTool(BaseTool):
+    """LLM-powered tool for intelligent output comparison"""
+    name: str = "llm_comparison_engine"
+    description: str = "Uses LLM to intelligently compare expected vs actual outputs"
+    
+    def __init__(self, llm: ChatOpenAI):
+        super().__init__()
+        self.llm = llm
+        self.comparison_prompt = ChatPromptTemplate.from_messages([
+            ("system", """You are an expert data comparison analyst. Your job is to:
+
+1. Compare expected vs actual outputs intelligently
+2. Identify meaningful differences (not just exact matches)
+3. Consider data type equivalencies (e.g., "1" vs 1, "true" vs True)
+4. Assess semantic equivalence where appropriate
+5. Provide detailed analysis of differences
+
+Be smart about:
+- String case sensitivity
+- Numeric precision
+- Date format variations
+- Boolean representations
+- Null/empty value equivalence
+
+Return a JSON object with:
+{
+    "passed": boolean,
+    "confidence": float (0-1),
+    "differences": {
+        "field_name": {
+            "expected": value,
+            "actual": value,
+            "severity": "critical|moderate|minor",
+            "explanation": "why this is different"
+        }
+    },
+    "summary": "overall assessment"
+}"""),
+            ("human", """Expected Output: {expected}
+
+Actual Output: {actual}
+
+Compare these outputs and determine if they match according to business logic standards. Consider semantic equivalence and business context.""")
+        ])
+    
+    def _run(self, expected: Dict[str, Any], actual: Dict[str, Any]) -> Dict[str, Any]:
+        """Compare outputs using LLM intelligence"""
+        try:
+            prompt = self.comparison_prompt.format_messages(
+                expected=json.dumps(expected, indent=2),
+                actual=json.dumps(actual, indent=2)
+            )
+            
+            response = self.llm.invoke(prompt)
+            content = response.content.strip()
+            
+            # Extract JSON
+            if '```json' in content:
+                json_start = content.find('```json') + 7
+                json_end = content.find('```', json_start)
+                content = content[json_start:json_end].strip()
+            elif '{' in content:
+                json_start = content.find('{')
+                brace_count = 0
+                json_end = json_start
+                for i, char in enumerate(content[json_start:], json_start):
+                    if char == '{':
+                        brace_count += 1
+                    elif char == '}':
+                        brace_count -= 1
+                        if brace_count == 0:
+                            json_end = i + 1
+                            break
+                content = content[json_start:json_end]
+            
+            result = json.loads(content)
+            logger.info(f"Comparison completed: {result.get('passed', False)}")
+            return result
+            
+        except json.JSONDecodeError as e:
+            logger.error(f"Failed to parse comparison result: {e}")
+            return {
+                "passed": expected == actual,
+                "confidence": 0.5,
+                "differences": {} if expected == actual else {"overall": {"expected": expected, "actual": actual, "severity": "critical", "explanation": "Simple comparison failed"}},
+                "summary": "Fallback comparison used due to parsing error"
+            }
+        except Exception as e:
+            logger.error(f"Error in comparison: {e}")
+            return {
+                "passed": False,
+                "confidence": 0.0,
+                "differences": {"error": {"expected": expected, "actual": actual, "severity": "critical", "explanation": str(e)}},
+                "summary": f"Comparison failed: {str(e)}"
+            }
+
+# Enhanced Router with TDD Processing
+def enhanced_router(state: AgentState) -> str:
+    """Enhanced router that handles TDD processing flow"""
+    next_action = state.get("next_action", "rule_generation")
+    
+    if next_action == "rule_generation":
+        return "tdd_rule_generator"
+    elif next_action == "validation":
+        return "validation_agent"
+    elif next_action == "correction":
+        return "correction_agent"
+    else:
+        return END
+
+# Main Enhanced Workflow Class
+class TDDAgenticBusinessRuleValidator:
+    """Enhanced LLM-powered system that processes TDD and validates generated business rules"""
+    
+    def __init__(self, openai_api_key: str, model: str = "gpt-4"):
+        # Initialize LLM
+        self.llm = ChatOpenAI(
+            api_key=openai_api_key,
+            model=model,
+            temperature=0.1,
+            max_tokens=4000
+        )
+        
+        # Initialize enhanced agents
+        self.tdd_rule_generator = TDDRuleGeneratorAgent(self.llm)
+        self.validation_agent = LLMValidationAgent(self.llm)
+        self.correction_agent = LLMCorrectionAgent(self.llm)  # Will need to add this
+        
+        # Build enhanced workflow
+        self.workflow = self._build_enhanced_workflow()
+    
+    def _build_enhanced_workflow(self) -> StateGraph:
+        """Build enhanced workflow with TDD processing"""
+        workflow = StateGraph(AgentState)
+        
+        # Add nodes
+        workflow.add_node("tdd_rule_generator", self.tdd_rule_generator)
+        workflow.add_node("validation_agent", self.validation_agent)
+        workflow.add_node("correction_agent", self.correction_agent)
+        
+        # Add edges with TDD flow
+        workflow.set_entry_point("tdd_rule_generator")
+        workflow.add_conditional_edges(
+            "tdd_rule_generator",
+            enhanced_router,
+            {
+                "validation_agent": "validation_agent",
+                END: END
+            }
+        )
+        workflow.add_conditional_edges(
+            "validation_agent",
+            enhanced_router,
+            {
+                "correction_agent": "correction_agent",
+                END: END
+            }
+        )
+        workflow.add_edge("correction_agent", END)
+        
+        return workflow.compile()
+    
+    def validate_from_tdd(
+        self,
+        technical_design_doc: str,
+        crude_rule_definition: str,
+        input_record: Dict[str, Any],
+        expected_output: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Complete workflow: TDD → Business Rule → Validation"""
+        
+        initial_state = AgentState(
+            messages=[HumanMessage(content="🎯 Processing TDD and validating generated business rule")],
+            # TDD inputs
+            technical_design_doc=technical_design_doc,
+            crude_rule_definition=crude_rule_definition,
+            generated_business_rule=None,
+            rule_generation_context=None,
+            # Validation inputs
+            input_record=input_record,
+            business_rule="",  # Will be set by generator
+            expected_output=expected_output,
+            actual_output=None,
+            validation_result=None,
+            correction_suggestion=None,
+            # Flow control
+            next_action="rule_generation",
+            validation_passed=False,
+            batch_data=None,
+            error_message=None,
+            reasoning_chain=[]
+        )
+        
+        # Execute complete workflow
+        final_state = self.workflow.invoke(initial_state)
+        
+        return {
+            "crude_rule": crude_rule_definition,
+            "generated_business_rule": final_state.get("generated_business_rule"),
+            "rule_generation_context": final_state.get("rule_generation_context"),
+            "validation_result": final_state.get("validation_result"),
+            "correction_suggestion": final_state.get("correction_suggestion"),
+            "passed": final_state.get("validation_passed", False),
+            "error": final_state.get("error_message"),
+            "reasoning_chain": final_state.get("reasoning_chain", []),
+            "messages": [msg.content for msg in final_state["messages"] if isinstance(msg, (AIMessage, HumanMessage))],
+            "tdd_powered": True
+        }
+
+# Add missing LLMCorrectionAgent
+class LLMCorrectionAgent:
+    """LLM-powered rule correction agent with TDD context"""
+    
+    def __init__(self, llm: ChatOpenAI):
+        self.llm = llm
+        self.correction_prompt = ChatPromptTemplate.from_messages([
+            ("system", """You are an expert business rule analyst and corrector with TDD context awareness. Analyze failed validations and suggest intelligent corrections.
+
+Consider:
+1. Original TDD context and crude rule definition
+2. Generated business rule that failed
+3. Input-output patterns
+4. Business domain knowledge
+5. Edge cases and assumptions
+
+Return JSON with enhanced analysis:
+{
+    "analysis": {
+        "tdd_interpretation_issues": "problems with original TDD interpretation",
+        "rule_generation_gaps": "gaps in the generated rule",
+        "validation_failure_root_cause": "why validation failed",
+        "business_logic_insights": "business domain insights"
+    },
+    "suggested_rule": "improved business rule",
+    "confidence": 0.95,
+    "reasoning": "detailed explanation",
+    "key_changes": ["main improvements"],
+    "tdd_corrections": ["suggested TDD clarifications"]
+}"""),
+            ("human", """**TDD-BASED RULE CORRECTION ANALYSIS**
+
+Original TDD Context: {tdd_context}
+
+Crude Rule Definition: {crude_rule}
+
+Generated Business Rule: {generated_rule}
+
+Validation Failure:
+- Input: {input_record}
+- Expected: {expected_output}
+- Actual: {actual_output}
+- Differences: {differences}
+
+Generation Context: {generation_context}
+
+Analyze this complete failure chain and suggest corrections.""")
+        ])
+    
+    def __call__(self, state: AgentState) -> AgentState:
+        """Generate enhanced corrections with TDD context"""
+        logger.info("LLMCorrectionAgent: Analyzing TDD-based rule failure")
+        
+        try:
+            validation_result = state["validation_result"]
+            
+            prompt = self.correction_prompt.format_messages(
+                tdd_context=state.get("technical_design_doc", ""),
+                crude_rule=state.get("crude_rule_definition", ""),
+                generated_rule=validation_result["generated_business_rule"],
+                input_record=json.dumps(validation_result["input_record"], indent=2),
+                expected_output=json.dumps(validation_result["expected_output"], indent=2),
+                actual_output=json.dumps(validation_result["actual_output"], indent=2),
+                differences=json.dumps(validation_result["differences"], indent=2),
+                generation_context=json.dumps(state.get("rule_generation_context", {}), indent=2)
+            )
+            
+            response = self.llm.invoke(prompt)
+            content = response.content.strip()
+            
+            # Extract JSON
+            if '```json' in content:
+                json_start = content.find('```json') + 7
+                json_end = content.find('```', json_start)
+                content = content[json_start:json_end].strip()
+            
+            correction_data = json.loads(content)
+            state["correction_suggestion"] = correction_data
+            state["next_action"] = "complete"
+            
+            analysis = correction_data.get("analysis", {})
+            state["messages"].append(AIMessage(
+                content=f"""🔧 **ENHANCED TDD-BASED CORRECTION ANALYSIS**
+
+**Root Cause Analysis**:
+• TDD Issues: {analysis.get('tdd_interpretation_issues', 'None identified')}
+• Rule Generation Gaps: {analysis.get('rule_generation_gaps', 'None identified')}
+• Validation Failure: {analysis.get('validation_failure_root_cause', 'Unknown')}
+• Business Insights: {analysis.get('business_logic_insights', 'None provided')}
+
+**Suggested Correction**:
+{correction_data.get('suggested_rule', 'No suggestion')}
+
+**Confidence**: {correction_data.get('confidence', 0.0):.1%}
+
+**TDD Recommendations**: {correction_data.get('tdd_corrections', [])}"""
+            ))
+            
+        except Exception as e:
+            logger.error(f"Enhanced correction error: {e}")
+            state["messages"].append(AIMessage(content=f"❌ Enhanced correction failed: {str(e)}"))
+            state["next_action"] = "complete"
+        
+        return state
+
+# Example Usage
+def example_tdd_usage():
+    """Example of TDD-powered validation system"""
+    
+    print("🤖 TDD-Powered Agentic Business Rule Validator")
+    print("=" * 60)
+    
+    # Example TDD content
+    example_tdd = """
+    Technical Design Document - Employee Status Management
+    
+    Section 4.2.3: Status Determination Logic
+    - Field: grgr_term_dt (termination date)
+    - Field: grgr_sts (employee status)
+    - Business Logic: Status should reflect current employment state
+    - Special Case: Date 12/31/9999 indicates no termination planned
+    - Implementation Notes: Compare termination date with current date
+    """
+    
+    # Crude rule from TDD
+    crude_rule = "term_dt field check -> if 9999 date then active else check if past"
+    
+    # Test case
+    input_record = {"grgr_term_dt": "2023-04-01"}
+    expected_output = {"grgr_sts": "TM"}  # Terminated since date is past
+    
+    print(f"TDD Content: {example_tdd[:100]}...")
+    print(f"Crude Rule: {crude_rule}")
+    print(f"Input: {input_record}")
+    print(f"Expected: {expected_output}")
+    print()
+    
+    print("Expected LLM Processing:")
+    print("1. 🧠 Parse TDD for business context")
+    print("2. 🔄 Convert crude rule to proper business rule")
+    print("3. ✅ Validate with contextual understanding")
+    print("4. 🔧 Provide TDD-aware corrections if needed")
+
+if __name__ == "__main__":
+    example_tdd_usage()
