@@ -1,0 +1,81 @@
+import pandas as pd
+
+# Step 1: Create t_cbms_attribute lookup table
+cbms_attribute = pd.DataFrame({
+    'attribute_name': ['GROUP ID FILTER', 'GROUP ID FILTER', 'BENEFIT ID FILTER', 'BENEFIT ID FILTER'],
+    'attribute_value': ['GID100', 'GID200', 'BID100', 'BID200']
+})
+
+# Step 2: Define valid/invalid groups
+VALID_GROUP_IDS = ['GID100', 'GID200']
+INVALID_GROUP_IDS = ['GID_INVALID']
+VALID_BENEFIT_IDS = ['BID100', 'BID200']
+INVALID_BENEFIT_IDS = ['BID_INVALID']
+TERM_DATES_VALID = ['9999-12-31', '2025-01-01', '2024-12-15']
+TERM_DATES_INVALID = ['INVALID', None, '0000-00-00']
+
+import random
+
+def get_random_term_date():
+    return random.choices(
+        TERM_DATES_VALID + TERM_DATES_INVALID,
+        weights=[3, 2, 2, 1, 1, 1],
+        k=1
+    )[0]
+
+def determine_status(term_dt, group_id, benefit_id):
+    if group_id in INVALID_GROUP_IDS:
+        return None, 256, 215, "BYPASS_GROUP_ID"
+    if benefit_id in INVALID_BENEFIT_IDS:
+        return None, 256, 215, "BYPASS_BENEFIT_ID"
+    if term_dt == '9999-12-31':
+        return 'AC', 226, 215, "PASS_VALID_OPEN"
+    if term_dt in TERM_DATES_INVALID:
+        return None, 267, 216, "FAIL_INVALID_DATE"
+    return 'TM', 226, 215, "PASS_VALID_TERMED"
+
+def generate_input_output_records(n=50):
+    input_records = []
+    output_records = []
+    
+    all_group_ids = VALID_GROUP_IDS + INVALID_GROUP_IDS
+    all_benefit_ids = VALID_BENEFIT_IDS + INVALID_BENEFIT_IDS
+    
+    for _ in range(n):
+        group_id = random.choice(all_group_ids)
+        benefit_id = random.choice(all_benefit_ids)
+        term_dt = get_random_term_date()
+        
+        grgr_sts, txn_status, rec_status, scenario = determine_status(term_dt, group_id, benefit_id)
+        
+        input_row = {
+            'grgr_id': group_id,
+            'hp_benefit_id': benefit_id,
+            'grgr_term_dt': term_dt
+        }
+        output_row = {
+            **input_row,
+            'grgr_sts': grgr_sts,
+            'transaction_status': txn_status,
+            'record_status': rec_status,
+            'final_scenario': scenario
+        }
+        
+        input_records.append(input_row)
+        output_records.append(output_row)
+        
+    return pd.DataFrame(input_records), pd.DataFrame(output_records)
+
+# Generate data
+input_df, output_df = generate_input_output_records()
+
+# Save all as CSVs
+input_path = "/mnt/data/input_records.csv"
+output_path = "/mnt/data/output_records.csv"
+lookup_path = "/mnt/data/t_cbms_attribute.csv"
+
+input_df.to_csv(input_path, index=False)
+output_df.to_csv(output_path, index=False)
+cbms_attribute.to_csv(lookup_path, index=False)
+
+input_path, output_path, lookup_path
