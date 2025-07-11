@@ -1,0 +1,889 @@
+import json
+import logging
+import time
+from typing import Dict, List, Any, Optional, TypedDict, Annotated
+from dataclasses import dataclass
+from enum import Enum
+import pandas as pd
+from langgraph.graph import StateGraph, END
+from llm.openai_client import get_azure_client, chat_completion
+from prompts.code_generation_prompt import generate_prompt_code
+from prompts.rule_generator import generate_prompt_rule
+from prompts.rule_validator import validation_rule_prompt
+from code_generation import rule_evaluate_batch
+from utils.utils import load_data, get_calculated_value
+from utils.utils import load_parquet_table
+from validate_transformation import eval_target_field
+
+# Enhanced state management
+class ProcessingStep(Enum):
+    INITIALIZED = "initialized"
+    RULE_GENERATION = "rule_generation" 
+    CODE_GENERATION = "code_generation"
+    VALIDATION = "validation"
+    IMPROVEMENT = "improvement"
+    FINALIZATION = "finalization"
+    COMPLETED = "completed"
+    ERROR = "error"
+
+@dataclass
+class RetryConfig:
+    max_retries: int = 3
+    base_delay: float = 1.0
+    exponential_backoff: bool = True
+    retry_on_json_error: bool = True
+    retry_on_llm_error: bool = True
+
+class AgentState(TypedDict):
+    # Input data
+    target_field: str
+    client_name: str
+    tdd_document: str
+    source_schema: Dict[str, Any]
+    cbms_data: Dict[str, Any]
+    
+    # Processing state
+    current_step: str
+    iteration_count: int
+    max_iterations: int
+    
+    # Generated outputs (removed tdd_analysis)
+    business_rules: Optional[Dict[str, Any]]
+    generated_code: Optional[str]
+    validation_results: Optional[Dict[str, Any]]
+    improvement_suggestions: Optional[List[Dict[str, Any]]]
+    validation_output: Optional[str]
+    
+    # Messages and logs
+    messages: List[str]
+    error_log: List[str]
+    
+    # Final outputs
+    final_rules: Optional[Dict[str, Any]]
+    final_code: Optional[str]
+    confidence_score: Optional[float]
+    
+    # Additional context
+    client_to_id: Optional[Dict[str, Any]]
+    client_to_conformity_csv: Optional[Dict[str, Any]]
+    txt_files: Optional[List[str]]
+    parquet_dir: Optional[str]
+    error_log_dir: Optional[str]
+    output_dir: Optional[str]
+    table_cache: Optional[Dict[str, Any]]
+    inmemory_dta: Optional[Dict[str, Any]]
+    
+    # Retry tracking
+    retry_counts: Dict[str, int]
+
+class AgentConfig:
+    """Configuration for the LangGraph agent"""
+    max_iterations: int = 5
+    confidence_threshold: float = 0.85
+    enable_auto_improvement: bool = True
+    api_version: str = "2024-02-15-preview"
+    max_tokens: int = 10000
+    validation_sample_size: int = 10
+    retry_config: RetryConfig = RetryConfig()
+
+class EnhancedRuleAgent:
+    """Enhanced LangGraph-based agent for rule generation and validation (without TDD analysis)"""
+    
+    def __init__(self, config: AgentConfig = None):
+        self.config = config or AgentConfig()
+        self.client = get_azure_client()
+        self.logger = logging.getLogger(__name__)
+        self.app = self._build_workflow()
+    
+    def _safe_llm_call(self, prompt: str, state: AgentState, operation_name: str, 
+                       max_tokens: Optional[int] = None) -> Dict[str, Any]:
+        """
+        Safely call LLM with retry logic and error handling
+        """
+        retry_count = state.get("retry_counts", {}).get(operation_name, 0)
+        max_retries = self.config.retry_config.max_retries
+        
+        for attempt in range(max_retries + 1):
+            try:
+                self.logger.info(f"[{operation_name.upper()}] Attempt {attempt + 1}/{max_retries + 1}")
+                
+                response = chat_completion(
+                    client=self.client,
+                    deployment=self.config.api_version,
+                    user_question=prompt,
+                    max_tokens=max_tokens or self.config.max_tokens
+                )
+                
+                # Clean and parse response
+                clean_response = self._clean_json_response(response)
+                
+                if self._is_valid_response(clean_response, operation_name):
+                    # Reset retry count on success
+                    if "retry_counts" not in state:
+                        state["retry_counts"] = {}
+                    state["retry_counts"][operation_name] = 0
+                    return {"success": True, "data": clean_response}
+                else:
+                    raise ValueError(f"Invalid response format for {operation_name}")
+                    
+            except (json.JSONDecodeError, ValueError) as e:
+                error_msg = f"{operation_name} JSON parsing failed (attempt {attempt + 1}): {str(e)}"
+                self.logger.warning(error_msg)
+                state["error_log"].append(error_msg)
+                
+                if attempt < max_retries and self.config.retry_config.retry_on_json_error:
+                    delay = self._calculate_delay(attempt)
+                    self.logger.info(f"Retrying {operation_name} in {delay} seconds...")
+                    time.sleep(delay)
+                    continue
+                else:
+                    return {"success": False, "error": error_msg, "fallback": self._get_fallback_response(operation_name)}
+                    
+            except Exception as e:
+                error_msg = f"{operation_name} LLM call failed (attempt {attempt + 1}): {str(e)}"
+                self.logger.error(error_msg)
+                state["error_log"].append(error_msg)
+                
+                if attempt < max_retries and self.config.retry_config.retry_on_llm_error:
+                    delay = self._calculate_delay(attempt)
+                    self.logger.info(f"Retrying {operation_name} in {delay} seconds...")
+                    time.sleep(delay)
+                    continue
+                else:
+                    return {"success": False, "error": error_msg, "fallback": self._get_fallback_response(operation_name)}
+        
+        # Update retry count
+        if "retry_counts" not in state:
+            state["retry_counts"] = {}
+        state["retry_counts"][operation_name] = retry_count + 1
+        
+        return {"success": False, "error": f"Max retries exceeded for {operation_name}", 
+                "fallback": self._get_fallback_response(operation_name)}
+    
+    def _clean_json_response(self, response: str) -> Any:
+        """Clean and parse JSON response with multiple fallback strategies"""
+        if not response:
+            raise ValueError("Empty response")
+        
+        # Try direct JSON parsing first
+        try:
+            return json.loads(response.strip())
+        except json.JSONDecodeError:
+            pass
+        
+        # Try to extract JSON from markdown code blocks
+        import re
+        json_pattern = r'```(?:json)?\s*(\{.*?\})\s*```'
+        matches = re.findall(json_pattern, response, re.DOTALL)
+        if matches:
+            try:
+                return json.loads(matches[0])
+            except json.JSONDecodeError:
+                pass
+        
+        # Try to find JSON-like structure
+        json_start = response.find('{')
+        json_end = response.rfind('}')
+        if json_start != -1 and json_end != -1 and json_end > json_start:
+            try:
+                return json.loads(response[json_start:json_end + 1])
+            except json.JSONDecodeError:
+                pass
+        
+        # Last resort: try to fix common JSON issues
+        cleaned = response.strip()
+        cleaned = re.sub(r'```json\s*', '', cleaned)
+        cleaned = re.sub(r'```\s*$', '', cleaned)
+        cleaned = re.sub(r'(\w+):', r'"\1":', cleaned)  # Fix unquoted keys
+        
+        try:
+            return json.loads(cleaned)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"Failed to parse JSON after all attempts: {str(e)}")
+    
+    def _is_valid_response(self, response: Any, operation_name: str) -> bool:
+        """Validate response structure based on operation type"""
+        if not isinstance(response, dict):
+            return False
+        
+        validation_rules = {
+            "rule_generation": ["business_rule", "transformation_steps"],
+            "code_generation": ["python_code"],
+            "validation": ["accuracy", "total_records"],
+            "improvement": ["issue_analysis", "rule_improvements"]
+        }
+        
+        required_fields = validation_rules.get(operation_name, [])
+        return all(field in response for field in required_fields)
+    
+    def _calculate_delay(self, attempt: int) -> float:
+        """Calculate delay for exponential backoff"""
+        if self.config.retry_config.exponential_backoff:
+            return self.config.retry_config.base_delay * (2 ** attempt)
+        return self.config.retry_config.base_delay
+    
+    def _get_fallback_response(self, operation_name: str) -> Dict[str, Any]:
+        """Provide fallback responses when LLM calls fail"""
+        fallbacks = {
+            "rule_generation": {
+                "business_rule": "Rule generation failed - manual intervention required",
+                "transformation_steps": ["Manual step required"],
+                "validation_criteria": ["Manual validation needed"],
+                "error_handling": ["Handle errors manually"]
+            },
+            "code_generation": {
+                "python_code": "# Code generation failed - manual implementation required\npass"
+            },
+            "validation": {
+                "accuracy": 0.0,
+                "total_records": 0,
+                "error_count": 1,
+                "status": "error"
+            },
+            "improvement": {
+                "issue_analysis": "Analysis failed - manual review needed",
+                "rule_improvements": [],
+                "code_improvements": [],
+                "priority_fixes": []
+            }
+        }
+        return fallbacks.get(operation_name, {"error": "Unknown operation"})
+    
+    def generate_rules(self, state: AgentState) -> AgentState:
+        """Step 1: Generate business rules with reactive prompting and retry logic"""
+        self.logger.info(f"[RULE_GENERATION] Generating rules for iteration {state.get('iteration_count', 0) + 1}")
+        
+        # Build reactive context based on previous iterations
+        context = self._build_reactive_context(state, "rule_generation")
+        
+        # Get base rule prompt
+        base_prompt = generate_prompt_rule(state['target_field'])
+        
+        # Enhanced prompt with TDD context (passed directly) and previous feedback
+        enhanced_prompt = f"""
+        {base_prompt}
+        
+        TARGET FIELD: {state['target_field']}
+        CLIENT: {state['client_name']}
+        
+        TDD DOCUMENT CONTEXT (use for understanding field requirements):
+        {state.get('tdd_document', '')}
+        
+        SOURCE SCHEMA:
+        {json.dumps(state.get('source_schema', {}), indent=2)}
+        
+        CBMS DATA CONTEXT:
+        {json.dumps(state.get('cbms_data', {}), indent=2)}
+        
+        PREVIOUS ITERATION FEEDBACK:
+        {context.get('previous_feedback', 'No previous feedback')}
+        
+        {context.get('improvement_context', '')}
+        
+        Generate production-ready business rules in JSON format:
+        {{
+            "business_rule": "Detailed explanation of transformation logic",
+            "input_fields": ["list", "of", "source", "fields"],
+            "transformation_steps": [
+                "Step 1: description",
+                "Step 2: description"
+            ],
+            "validation_criteria": ["criteria1", "criteria2"],
+            "error_handling": ["error condition 1", "error condition 2"]
+        }}
+        
+        Focus on extracting the business logic directly from the TDD document and field requirements.
+        """
+        
+        result = self._safe_llm_call(enhanced_prompt, state, "rule_generation")
+        
+        if result["success"]:
+            state["business_rules"] = result["data"]
+            state["current_step"] = ProcessingStep.RULE_GENERATION.value
+            state["messages"].append(f"Business rules generated for {state['target_field']}")
+            self.logger.info(f"[RULE_GENERATION] Generated rules: {json.dumps(state['business_rules'], indent=2)}")
+        else:
+            state["business_rules"] = result["fallback"]
+            state["error_log"].append(f"Rule generation failed: {result['error']}")
+        
+        return state
+    
+    def generate_code(self, state: AgentState) -> AgentState:
+        """Step 2: Generate Python transformation code with reactive improvements"""
+        self.logger.info(f"[CODE_GENERATION] Generating code for {state['target_field']}")
+        
+        # Build reactive context
+        context = self._build_reactive_context(state, "code_generation")
+        
+        business_rule_str = json.dumps(state.get('business_rules', {}), indent=2)
+        fields_used_from_cbms = state.get('cbms_data', {})
+        input_cols = str(list(state.get('source_schema', {}).keys()))
+        
+        # Enhanced code prompt with previous issues context
+        code_prompt = generate_prompt_code(
+            business_rule=business_rule_str,
+            fields_used_from_cbms=fields_used_from_cbms,
+            input_cols=input_cols
+        )
+        
+        improvement_context = ""
+        if context.get('improvement_suggestions'):
+            improvement_context = f"""
+            PREVIOUS CODE ISSUES TO ADDRESS:
+            {json.dumps(context.get('improvement_suggestions', {}), indent=2)}
+            
+            Please fix the above issues in the new code generation.
+            """
+        
+        enhanced_code_prompt = f"""
+        {code_prompt}
+        {improvement_context}
+        
+        Generate production-ready Python code for field: {state['target_field']}
+        
+        TDD CONTEXT FOR REFERENCE:
+        {state.get('tdd_document', '')}
+        
+        Requirements:
+        1. Add detailed logging statements and save it in the logs/target_field.log
+        2. Return code in JSON format with 'python_code' key
+        3. Make sure that logging should contain detailed syntax or logical error if any
+        4. Include comprehensive error handling
+        5. Follow Python best practices
+        
+        Return format:
+        {{
+            "python_code": "your complete Python code here"
+        }}
+        """
+        
+        result = self._safe_llm_call(enhanced_code_prompt, state, "code_generation", max_tokens=15000)
+        
+        if result["success"]:
+            # Extract and save code
+            code_result = result["data"]
+            generated_code = code_result.get("python_code") or code_result.get("Python code") or ""
+            
+            if generated_code:
+                # Save code to file
+                target_field = state.get('target_field', 'unknown')
+                file_name = f"./transformation_codes/{target_field}.py"
+                
+                try:
+                    import os
+                    os.makedirs(os.path.dirname(file_name), exist_ok=True)
+                    with open(file_name, 'w') as f:
+                        f.write(generated_code)
+                    
+                    self.logger.info(f"[CODE_GENERATION] Saved code for '{target_field}' at {file_name}")
+                    
+                    state["generated_code"] = generated_code
+                    state["current_step"] = ProcessingStep.CODE_GENERATION.value
+                    state["messages"].append(f"Python code generated for {state['target_field']}")
+                except Exception as e:
+                    error_msg = f"Code generation failed: {str(e)}"
+                    state["error_log"].append(error_msg)
+                    self.logger.error(error_msg)
+            else:
+                state["error_log"].append("No code generated in response")
+        else:
+            state["generated_code"] = result["fallback"]["python_code"]
+            state["error_log"].append(f"Code generation failed: {result['error']}")
+        
+        return state
+    
+    def validate_solution(self, state: AgentState) -> AgentState:
+        """Step 3: Validate the generated solution with retry logic"""
+        self.logger.info(f"[VALIDATION] Validating solution for: {state['target_field']}")
+        
+        try:
+            inmemory_dta = state.get('inmemory_dta', {})
+            fields_used_from_cbms = state.get('cbms_data', {})
+            
+            # Run evaluation with small sample for efficiency
+            all_eval_dfs = eval_target_field(
+                target_field=state.get('target_field', ''),
+                inmemory_dta=inmemory_dta,
+                fields_used_from_cbms=fields_used_from_cbms,
+                n_random=self.config.validation_sample_size,
+                parquet_dir=state.get('parquet_dir', './data'),
+                error_log_dir=state.get('error_log_dir', './errors'),
+                save_intermediates=False,
+                output_dir=state.get('output_dir', './outputs'),
+                table_cache=state.get('table_cache', {})
+            )
+            
+            # Calculate validation metrics
+            validation_results = self._calculate_metrics(all_eval_dfs, state['target_field'])
+            
+            state["validation_results"] = validation_results
+            state["current_step"] = ProcessingStep.VALIDATION.value
+            
+            accuracy = validation_results.get('accuracy', 0)
+            self.logger.info(f"[VALIDATION] Validation completed. Accuracy: {accuracy:.1%}")
+            state["messages"].append(f"Validation completed for {state['target_field']}. Accuracy: {accuracy:.1%}")
+            
+        except Exception as e:
+            error_msg = f"Validation failed: {str(e)}"
+            state["error_log"].append(error_msg)
+            self.logger.error(error_msg)
+            
+            # Set default validation results
+            state["validation_results"] = {
+                "accuracy": 0.0,
+                "total_records": 0,
+                "error_count": 1,
+                "validation_error": str(e)
+            }
+        
+        state["validation_output"] = str(all_eval_dfs) if 'all_eval_dfs' in locals() else ""
+        return state
+    
+    def _build_reactive_context(self, state: AgentState, step: str) -> Dict[str, str]:
+        """Build reactive context based on previous iterations and feedback"""
+        context = {}
+        
+        # Add previous validation results as feedback
+        if state.get("validation_results"):
+            accuracy = state["validation_results"].get("accuracy", 0)
+            if accuracy < self.config.confidence_threshold:
+                context["previous_feedback"] = f"""
+                Previous iteration had low accuracy ({accuracy:.1%}).
+                Issues identified: {state.get('validation_results', {}).get('issues', 'Unknown')}
+                """
+        
+        # Add improvement suggestions from previous iterations
+        if state.get("improvement_suggestions"):
+            context["improvement_context"] = f"""
+            PREVIOUS ISSUES TO ADDRESS:
+            {json.dumps(state.get('improvement_suggestions', {}), indent=2)}
+            
+            Please address these specific issues in your response.
+            """
+        
+        # Add error context from previous iterations
+        if state.get("error_log"):
+            recent_errors = state["error_log"][-3:]  # Last 3 errors
+            context["error_context"] = f"""
+            RECENT ERRORS TO AVOID:
+            {json.dumps(recent_errors, indent=2)}
+            """
+        
+        return context
+    
+    def _calculate_metrics(self, eval_df: pd.DataFrame, target_field: str) -> Dict[str, Any]:
+        """Calculate validation metrics from evaluation results"""
+        try:
+            if eval_df is None or eval_df.empty:
+                return {
+                    "accuracy": 0.0,
+                    "total_records": 0,
+                    "correct_predictions": 0,
+                    "error_count": 0,
+                    "status": "no_data"
+                }
+            
+            total_records = len(eval_df)
+            error_count = eval_df[eval_df['error'].notna() & (eval_df['error'].astype(str).str.strip() != '')].shape[0]
+            
+            # Calculate accuracy (excluding null agent values and expected values comparison)
+            if 'rule_agent_value' in eval_df.columns and 'eagle_value' in eval_df.columns:
+                correct_predictions = (eval_df['rule_agent_value'] == eval_df['eagle_value']).sum()
+                accuracy = correct_predictions / total_records if total_records > 0 else 0
+            else:
+                correct_predictions = 0
+                accuracy = 0.0
+            
+            return {
+                "accuracy": accuracy,
+                "total_records": total_records,
+                "correct_predictions": int(correct_predictions),
+                "error_count": error_count,
+                "success_rate": (total_records - error_count) / total_records if total_records > 0 else 0,
+                "status": "completed"
+            }
+            
+        except Exception as e:
+            return {
+                "accuracy": 0.0,
+                "total_records": 0,
+                "error_count": 1,
+                "status": "error",
+                "error_details": str(e)
+            }
+    
+    def improve_solution(self, state: AgentState) -> AgentState:
+        """Step 4: Analyze results and suggest improvements with retry logic"""
+        self.logger.info(f"[IMPROVEMENT] Analyzing issues for iteration {state.get('iteration_count', 0) + 1}")
+        
+        validation_results = state.get('validation_results', {})
+        current_rules = state.get('business_rules', {})
+        current_code = state.get('generated_code', '')
+        validation_output = state.get('validation_output', '')
+        target_field = state.get('target_field', '')
+        
+        # Read error log if exists
+        error_log = ""
+        try:
+            with open(f'./logs/{target_field}.log', 'r') as f:
+                error_log = f.read()
+        except FileNotFoundError:
+            error_log = "No errors while executing transformation function"
+        except Exception as e:
+            error_log = state.get('error_log', 'no error, code ran successfully')
+        
+        improvement_prompt = f"""
+        Analyze the validation results and provide specific improvements for {state['target_field']}.
+        
+        CURRENT PERFORMANCE:
+        - Accuracy: {validation_results.get('accuracy', 0):.1%}
+        - Total Records: {validation_results.get('total_records', 0)}
+        - Errors: {validation_results.get('error_count', 0)}
+        
+        CURRENT BUSINESS RULES:
+        {json.dumps(current_rules, indent=2)}
+        
+        VALIDATION DETAILS:
+        {json.dumps(validation_results, indent=2)}
+        Actual & generated values given below
+        rule_agent_value = generated value
+        eagle_value = actual value
+        {validation_output}
+        Also refer TDD in case if u want to understand the mistakes
+        TDD DOCUMENT:
+        {state.get('tdd_document', '')}
+        Error after running code given
+        {error_log}
+        
+        ANALYZE and provide specific improvements in JSON format:
+        {{
+            "issue_analysis": "What went wrong and why",
+            "rule_improvements": [
+                "Specific rule modification 1",
+                "Specific rule modification 2"
+            ],
+            "code_improvements": [
+                "Specific code fix 1", 
+                "Specific code fix 2"
+            ],
+            "priority_fixes": ["Most critical issue to address"],
+            "expected_impact": "Expected improvement percentage"
+        }}
+        
+        Focus on actionable, specific improvements.
+        """
+        
+        result = self._safe_llm_call(improvement_prompt, state, "improvement")
+        
+        if result["success"]:
+            improvements = result["data"]
+            state["improvement_suggestions"] = improvements
+            state["current_step"] = ProcessingStep.IMPROVEMENT.value
+            state["messages"].append(f"Improvement analysis completed for {state['target_field']}")
+            self.logger.info(f"[IMPROVEMENT] Generated improvements: {json.dumps(improvements, indent=2)}")
+        else:
+            state["improvement_suggestions"] = result["fallback"]
+            state["error_log"].append(f"Improvement analysis failed: {result['error']}")
+        
+        return state
+    
+    def finalize_results(self, state: AgentState) -> AgentState:
+        """Step 5: Finalize and package results"""
+        self.logger.info(f"[FINALIZATION] Finalizing results for: {state['target_field']}")
+        
+        # Calculate final confidence score
+        validation_results = state.get('validation_results', {})
+        accuracy = validation_results.get('accuracy', 0)
+        iteration_count = state.get('iteration_count', 0)
+        
+        # Penalize for too many iterations
+        iteration_penalty = max(0, (iteration_count - 1) * 0.05)
+        confidence_score = max(0, accuracy - iteration_penalty)
+        
+        # Package final results
+        state["final_rules"] = state.get('business_rules', {})
+        state["final_code"] = state.get('generated_code', '')
+        state["confidence_score"] = confidence_score
+        state["current_step"] = ProcessingStep.FINALIZATION.value
+        
+        final_message = f"Processing completed for {state['target_field']}. " \
+                        f"Final confidence score: {confidence_score:.1%} (iterations: {iteration_count})"
+        state["messages"].append(final_message)
+        
+        return state
+    
+    def decide_next_step(self, state: AgentState) -> str:
+        """Decision logic: improve or finalize based on validation results"""
+        validation_results = state.get('validation_results', {})
+        accuracy = validation_results.get('accuracy', 0)
+        iteration_count = state.get('iteration_count', 0)
+        
+        # Check if we should try to improve
+        should_improve = (
+            accuracy < self.config.confidence_threshold and
+            iteration_count < self.config.max_iterations and
+            self.config.enable_auto_improvement and
+            not validation_results.get('validation_error')  # Don't improve if there was a validation error
+        )
+        
+        return "improve" if should_improve else "finalize"
+    
+    def decide_iteration(self, state: AgentState) -> str:
+        """Decision logic: iterate again or finalize"""
+        iteration_count = state.get('iteration_count', 0)
+        return "iterate" if iteration_count < self.config.max_iterations else "finalize"
+    
+    def _build_workflow(self) -> StateGraph:
+        """Build the LangGraph workflow with all nodes and edges (without TDD analysis)"""
+        workflow = StateGraph(AgentState)
+        
+        # Add nodes (removed analyze_tdd)
+        workflow.add_node("generate_rules", self.generate_rules)  
+        workflow.add_node("generate_code", self.generate_code)
+        workflow.add_node("validate_solution", self.validate_solution)
+        workflow.add_node("improve_solution", self.improve_solution)
+        workflow.add_node("finalize_results", self.finalize_results)
+        
+        # Set entry point (changed from analyze_tdd to generate_rules)
+        workflow.set_entry_point("generate_rules")
+        
+        # Add edges (removed analyze_tdd edges)
+        workflow.add_edge("generate_rules", "generate_code")
+        workflow.add_edge("generate_code", "validate_solution")
+        
+        # Add conditional edges
+        workflow.add_conditional_edges(
+            "validate_solution",
+            self.decide_next_step,
+            {
+                "improve": "improve_solution",
+                "finalize": "finalize_results"
+            }
+        )
+        
+        workflow.add_conditional_edges(
+            "improve_solution", 
+            self.decide_iteration,
+            {
+                "iterate": "generate_rules",
+                "finalize": "finalize_results"
+            }
+        )
+        
+        # End workflow
+        workflow.add_edge("finalize_results", END)
+        
+        return workflow.compile()
+    
+    def run(self, initial_state: Dict[str, Any]) -> Dict[str, Any]:
+        """Run the complete agent workflow"""
+        # Ensure required fields are present
+        required_fields = ['target_field', 'client_name', 'tdd_document']
+        for field in required_fields:
+            if field not in initial_state:
+                return {
+                    "success": False,
+                    "error": f"Missing required field: {field}",
+                    "required_fields": required_fields
+                }
+        
+        # Initialize state with defaults (removed tdd_analysis)
+        state = AgentState(
+            target_field=initial_state['target_field'],
+            client_name=initial_state.get('client_name', 'Unknown Client'),
+            tdd_document=initial_state['tdd_document'],
+            source_schema=initial_state.get('source_schema', {}),
+            cbms_data=initial_state.get('cbms_data', {}),
+            
+            # Processing state
+            current_step="initialized",
+            iteration_count=0,
+            max_iterations=self.config.max_iterations,
+            
+            # Generated outputs (removed tdd_analysis)
+            business_rules=None,
+            generated_code=None,
+            validation_results=None,
+            improvement_suggestions=None,
+            validation_output=None,
+            
+            # Messages and logs
+            messages=[],
+            error_log=[],
+            
+            # Final outputs
+            final_rules=None,
+            final_code=None,
+            confidence_score=None,
+            
+            # Additional context
+            client_to_id=initial_state.get('client_to_id', {}),
+            client_to_conformity_csv=initial_state.get('client_to_conformity_csv', {}),
+            txt_files=initial_state.get('txt_files', []),
+            parquet_dir=initial_state.get('parquet_dir', './data'),
+            error_log_dir=initial_state.get('error_log_dir', './errors'),
+            output_dir=initial_state.get('output_dir', './outputs'),
+            table_cache=initial_state.get('table_cache', {}),
+            inmemory_dta=initial_state.get('inmemory_dta', {}),
+            
+            # Retry tracking
+            retry_counts={}
+        )
+        
+        try:
+            self.logger.info(f"Starting agent workflow for target field: {state['target_field']} (skipping TDD analysis)")
+            
+            # Run the workflow
+            final_state = self.app.invoke(state)
+            
+            return {
+                "success": True,
+                "target_field": final_state.get("target_field"),
+                "final_rules": final_state.get("final_rules"),
+                "final_code": final_state.get("final_code"),
+                "confidence_score": final_state.get("confidence_score"),
+                "validation_results": final_state.get("validation_results"),
+                "iteration_count": final_state.get("iteration_count"),
+                "messages": final_state.get("messages"),
+                "error_log": final_state.get("error_log")
+            }
+            
+        except Exception as e:
+            error_msg = f"Agent execution failed: {str(e)}"
+            self.logger.error(error_msg)
+            return {
+                "success": False,
+                "error": error_msg,
+                "target_field": initial_state.get('target_field', 'unknown')
+            }
+
+
+class AgentRunner:
+    """Helper class to run the agent with your existing setup"""
+    
+    def __init__(self, config: AgentConfig = None):
+        self.agent = EnhancedRuleAgent(config)
+        self.logger = logging.getLogger(__name__)
+    
+    def run_for_field(self, target_field: str, tdd_document: str, **kwargs) -> Dict[str, Any]:
+        """
+        Run agent for a specific target field
+        
+        Args:
+            target_field: Target field to process
+            tdd_document: Technical design document content
+            **kwargs: Additional arguments like client_name, source_schema, etc.
+        """
+        
+        agent_inputs = {
+            "target_field": target_field,
+            "client_name": kwargs.get('client_name', 'OscarHealthFirst'),
+            "tdd_document": tdd_document,
+            "source_schema": kwargs.get('source_schema', {}),
+            "cbms_data": kwargs.get('cbms_data', {}),
+            "client_to_id": kwargs.get('client_to_id', {}),
+            "client_to_conformity_csv": kwargs.get('client_to_conformity_csv', {}),
+            "txt_files": kwargs.get('txt_files', []),
+            "parquet_dir": kwargs.get('parquet_dir', './data'),
+            "error_log_dir": kwargs.get('error_log_dir', './errors'),
+            "output_dir": kwargs.get('output_dir', './outputs'),
+            "table_cache": kwargs.get('table_cache', {}),
+            "inmemory_dta": kwargs.get('inmemory_dta', {})
+        }
+        
+        self.logger.info(f"[AGENT_CONFIG] Running agent for field: {target_field} (no TDD analysis)")
+        return self.agent.run(agent_inputs)
+
+
+# Example usage and integration with your existing code
+def example_usage():
+    """Example of how to use the enhanced agent without TDD analysis"""
+    
+    # Configure the agent
+    config = AgentConfig(
+        max_iterations=3,
+        confidence_threshold=0.85,
+        enable_auto_improvement=True,
+        validation_sample_size=10,
+        retry_config=RetryConfig(
+            max_retries=3,
+            base_delay=1.0,
+            exponential_backoff=True,
+            retry_on_json_error=True,
+            retry_on_llm_error=True
+        )
+    )
+    
+    # Initialize agent runner
+    runner = AgentRunner(config)
+    
+    # Example TDD document
+    tdd_document = """
+    Field: customer_age
+    Description: Customer age calculation based on date of birth
+    Logic: Calculate age as current_date - date_of_birth in years
+    Validation: Age should be between 0 and 120 years
+    Source Fields: date_of_birth, current_date
+    """
+    
+    # Run agent (TDD document will be passed directly to rule generation)
+    result = runner.run_for_field(
+        target_field="customer_age",
+        tdd_document=tdd_document,
+        client_name="OscarHealthFirst",
+        source_schema={"date_of_birth": "datetime", "current_date": "datetime"},
+        cbms_data={"age_calculation": "standard"}
+    )
+    
+    # Check results
+    if result["success"]:
+        print(f"✅ Agent completed successfully!")
+        print(f"Target Field: {result['target_field']}")
+        print(f"Confidence Score: {result['confidence_score']:.1%}")
+        print(f"Iterations: {result['iteration_count']}")
+        print(f"Generated Code: {result['final_code'][:100]}...")
+    else:
+        print(f"❌ Agent failed: {result['error']}")
+    
+    return result
+
+
+# Integration with your existing workflow
+def integrate_with_existing_code():
+    """
+    Integration example showing how to replace your existing workflow
+    """
+    
+    # Your existing initialization code
+    logging.basicConfig(level=logging.INFO)
+    
+    # Create enhanced agent with your preferred configuration
+    agent_config = AgentConfig(
+        max_iterations=5,
+        confidence_threshold=0.8,
+        enable_auto_improvement=True,
+        validation_sample_size=10
+    )
+    
+    runner = AgentRunner(agent_config)
+    
+    # Your existing data loading (keep as is)
+    # state = load_your_initial_state()
+    
+    # Replace your existing agent call with:
+    # result = runner.run_for_field(
+    #     target_field=state['target_field'],
+    #     tdd_document=state['tdd_document'],
+    #     client_name=state['client_name'],
+    #     source_schema=state['source_schema'],
+    #     cbms_data=state['cbms_data'],
+    #     # ... other parameters from your state
+    # )
+    
+    # Handle results as needed
+    # return result
+
+
+if __name__ == "__main__":
+    # Run example
+    example_usage()
