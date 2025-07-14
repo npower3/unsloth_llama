@@ -73,19 +73,19 @@ def clean_strikethrough_patterns(text):
     """
     Remove common strikethrough patterns from text
     """
-    # Common strikethrough patterns
+    # Common strikethrough patterns with proper replacements
     patterns = [
-        r'~~(.*?)~~',  # ~~text~~
-        r'<s>(.*?)</s>',  # <s>text</s>
-        r'<strike>(.*?)</strike>',  # <strike>text</strike>
-        r'<del>(.*?)</del>',  # <del>text</del>
-        r'\u0336([^\u0336]*)\u0336',  # Unicode strikethrough
-        r'[\u0336]',  # Remove strikethrough combining character
+        (r'~~(.*?)~~', r'\1'),  # ~~text~~ -> text
+        (r'<s>(.*?)</s>', r'\1'),  # <s>text</s> -> text
+        (r'<strike>(.*?)</strike>', r'\1'),  # <strike>text</strike> -> text
+        (r'<del>(.*?)</del>', r'\1'),  # <del>text</del> -> text
+        (r'\u0336([^\u0336]*)\u0336', r'\1'),  # Unicode strikethrough
+        (r'[\u0336]', ''),  # Remove strikethrough combining character
     ]
     
     clean_text = text
-    for pattern in patterns:
-        clean_text = re.sub(pattern, r'\1', clean_text, flags=re.IGNORECASE)
+    for pattern, replacement in patterns:
+        clean_text = re.sub(pattern, replacement, clean_text, flags=re.IGNORECASE)
     
     return clean_text
 
