@@ -1,0 +1,46 @@
+import fitz  # PyMuPDF
+
+def extract_text_no_strikethrough(pdf_file):
+    """
+    Extract text from PDF, skip strikethrough text
+    """
+    # Open PDF
+    doc = fitz.open(pdf_file)
+    all_text = []
+    
+    # Go through each page
+    for page_num in range(len(doc)):
+        page = doc[page_num]
+        
+        # Get text with formatting info
+        blocks = page.get_text("dict")["blocks"]
+        
+        for block in blocks:
+            if "lines" in block:
+                for line in block["lines"]:
+                    line_text = ""
+                    
+                    for span in line["spans"]:
+                        # Check if text is strikethrough
+                        flags = span.get("flags", 0)
+                        
+                        # Skip if strikethrough (flag 16)
+                        if not (flags & 16):
+                            line_text += span["text"]
+                    
+                    if line_text.strip():
+                        all_text.append(line_text.strip())
+    
+    doc.close()
+    return "\n".join(all_text)
+
+# How to use:
+pdf_file = "your_file.pdf"  # Change this to your PDF file
+clean_text = extract_text_no_strikethrough(pdf_file)
+print(clean_text)
+
+# Save to file
+with open("output.txt", "w", encoding="utf-8") as f:
+    f.write(clean_text)
+    
+print("Done! Text saved to output.txt")
