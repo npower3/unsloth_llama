@@ -1,46 +1,156 @@
 import fitz  # PyMuPDF
+import re
 
 def extract_text_no_strikethrough(pdf_file):
     """
-    Extract text from PDF, skip strikethrough text
+    Extract text from PDF, remove strikethrough text using multiple methods
     """
-    # Open PDF
     doc = fitz.open(pdf_file)
     all_text = []
     
-    # Go through each page
     for page_num in range(len(doc)):
         page = doc[page_num]
         
-        # Get text with formatting info
-        blocks = page.get_text("dict")["blocks"]
+        # Method 1: Check text annotations and drawings
+        text_dict = page.get_text("dict")
+        drawings = page.get_drawings()  # Get line drawings (strikethrough lines)
         
-        for block in blocks:
+        # Get all text spans with their positions
+        text_spans = []
+        for block in text_dict["blocks"]:
             if "lines" in block:
                 for line in block["lines"]:
-                    line_text = ""
-                    
                     for span in line["spans"]:
-                        # Check if text is strikethrough
-                        flags = span.get("flags", 0)
+                        text_spans.append({
+                            'text': span['text'],
+                            'bbox': span['bbox'],  # [x0, y0, x1, y1]
+                            'flags': span.get('flags', 0)
+                        })
+        
+        # Find text that has lines drawn through it
+        clean_spans = []
+        for span in text_spans:
+            is_strikethrough = False
+            
+            # Check multiple strikethrough indicators
+            # 1. Check formatting flags
+            if span['flags'] & 16:  # Strikethrough flag
+                is_strikethrough = True
+            
+            # 2. Check if there's a line drawn through this text
+            x0, y0, x1, y1 = span['bbox']
+            text_middle_y = (y0 + y1) / 2
+            
+            for drawing in drawings:
+                for item in drawing['items']:
+                    if item[0] == 'l':  # Line drawing
+                        line_start = item[1]
+                        line_end = item[2]
                         
-                        # Skip if strikethrough (flag 16)
-                        if not (flags & 16):
-                            line_text += span["text"]
-                    
-                    if line_text.strip():
-                        all_text.append(line_text.strip())
+                        # Check if line goes through text horizontally
+                        if (abs(line_start.y - text_middle_y) < 3 and
+                            abs(line_end.y - text_middle_y) < 3 and
+                            line_start.x <= x1 and line_end.x >= x0):
+                            is_strikethrough = True
+                            break
+            
+            if not is_strikethrough:
+                clean_spans.append(span['text'])
+        
+        # Join clean text
+        page_text = ''.join(clean_spans)
+        
+        # Method 2: Also try pattern-based cleaning
+        page_text = clean_strikethrough_patterns(page_text)
+        
+        if page_text.strip():
+            all_text.append(page_text.strip())
     
     doc.close()
     return "\n".join(all_text)
 
-# How to use:
-pdf_file = "your_file.pdf"  # Change this to your PDF file
+def clean_strikethrough_patterns(text):
+    """
+    Remove common strikethrough patterns from text
+    """
+    # Common strikethrough patterns
+    patterns = [
+        r'~~(.*?)~~',  # ~~text~~
+        r'<s>(.*?)</s>',  # <s>text</s>
+        r'<strike>(.*?)</strike>',  # <strike>text</strike>
+        r'<del>(.*?)</del>',  # <del>text</del>
+        r'\u0336([^\u0336]*)\u0336',  # Unicode strikethrough
+        r'[\u0336]',  # Remove strikethrough combining character
+    ]
+    
+    clean_text = text
+    for pattern in patterns:
+        clean_text = re.sub(pattern, r'\1', clean_text, flags=re.IGNORECASE)
+    
+    return clean_text
+
+def alternative_extract(pdf_file):
+    """
+    Alternative method using character-level analysis
+    """
+    try:
+        import pdfplumber
+        
+        clean_text = []
+        with pdfplumber.open(pdf_file) as pdf:
+            for page in pdf.pages:
+                chars = page.chars
+                
+                # Group characters by line and check for strikethrough
+                lines = {}
+                for char in chars:
+                    y = round(char['y0'])
+                    if y not in lines:
+                        lines[y] = []
+                    lines[y].append(char)
+                
+                # Check each line for strikethrough
+                for y in sorted(lines.keys(), reverse=True):
+                    line_chars = sorted(lines[y], key=lambda c: c['x0'])
+                    line_text = ""
+                    
+                    # Simple heuristic: if there are many dash/line characters, skip
+                    dash_count = sum(1 for c in line_chars if c['text'] in '—-−_')
+                    if dash_count > len(line_chars) * 0.3:  # 30% dashes = likely strikethrough
+                        continue
+                    
+                    for char in line_chars:
+                        if char['text'] not in '—-−_':  # Skip line characters
+                            line_text += char['text']
+                    
+                    if line_text.strip():
+                        clean_text.append(line_text.strip())
+        
+        return "\n".join(clean_text)
+        
+    except ImportError:
+        print("pdfplumber not available, using PyMuPDF only")
+        return None
+
+# Usage
+pdf_file = "your_file.pdf"  # Change this
+
+print("Extracting text without strikethrough...")
+
+# Try main method
 clean_text = extract_text_no_strikethrough(pdf_file)
+
+# If still seeing strikethrough, try alternative
+if "strikethrough still visible" in clean_text.lower():  # You can check manually
+    print("Trying alternative method...")
+    alt_text = alternative_extract(pdf_file)
+    if alt_text:
+        clean_text = alt_text
+
 print(clean_text)
 
 # Save to file
 with open("output.txt", "w", encoding="utf-8") as f:
     f.write(clean_text)
-    
-print("Done! Text saved to output.txt")
+
+print("Done! Saved to output.txt")
