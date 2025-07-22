@@ -24,39 +24,7 @@ def get_unique_cbms_fields(component_name, compnt_cbms_map):
     # Your existing implementation here - should return list of table keys
     pass
 
-class DataFrameOptimizer:
-    @staticmethod
-    def reduce_memory_usage(df):
-        """Reduce memory usage by optimizing data types"""
-        start_mem = df.memory_usage(deep=True).sum() / 1024**2
-        
-        for col in df.columns:
-            col_type = df[col].dtype
-            
-            if col_type != 'object':
-                c_min = df[col].min()
-                c_max = df[col].max()
-                
-                if str(col_type)[:3] == 'int':
-                    if c_min > np.iinfo(np.int8).min and c_max < np.iinfo(np.int8).max:
-                        df[col] = df[col].astype(np.int8)
-                    elif c_min > np.iinfo(np.int16).min and c_max < np.iinfo(np.int16).max:
-                        df[col] = df[col].astype(np.int16)
-                    elif c_min > np.iinfo(np.int32).min and c_max < np.iinfo(np.int32).max:
-                        df[col] = df[col].astype(np.int32)
-                        
-                elif str(col_type)[:5] == 'float':
-                    if c_min > np.finfo(np.float32).min and c_max < np.finfo(np.float32).max:
-                        df[col] = df[col].astype(np.float32)
-            else:
-                # Convert object columns to category if they have repeated values
-                if df[col].nunique() / len(df) < 0.5:  # Less than 50% unique values
-                    df[col] = df[col].astype('category')
-        
-        end_mem = df.memory_usage(deep=True).sum() / 1024**2
-        print(f'Memory usage decreased from {start_mem:.2f} MB to {end_mem:.2f} MB '
-              f'({100 * (start_mem - end_mem) / start_mem:.1f}% reduction)')
-        return df
+# Memory optimization removed as requested
 
 class Pipeline:
     def __init__(self, input_loc: str, output_loc: str):
@@ -90,27 +58,18 @@ class Pipeline:
         
         # Pre-compute values from each DataFrame in the dictionary
         self.table_cache_values = {}
-        self.table_cache_optimized = {}
         
         for key, df in self.table_cache.items():
             if isinstance(df, pd.DataFrame) and not df.empty:
-                # Optimize memory usage
-                optimized_df = DataFrameOptimizer.reduce_memory_usage(df.copy())
-                
                 # Pre-compute the values we'll need during processing
                 # Assuming you need values from the first column - adjust as needed
-                values = set(optimized_df.iloc[:, 0].values)
+                values = set(df.iloc[:, 0].values)
                 self.table_cache_values[key] = values
-                self.table_cache_optimized[key] = optimized_df
                 
             else:
                 self.table_cache_values[key] = set()
-                self.table_cache_optimized[key] = df
         
         print(f"Pre-computed values for {len(self.table_cache_values)} tables")
-        
-        # Optional: Replace original table_cache to save memory
-        # self.table_cache = self.table_cache_optimized
 
     def get_optimized_cbms_values(self, component_name):
         """Fast lookup for CBMS values using pre-computed sets"""
