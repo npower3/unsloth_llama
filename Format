@@ -1,0 +1,116 @@
+import textwrap
+import re
+
+
+def wrap_text(text, width=80):
+    """
+    Wrap text to specified width, preserving bullets and numbered steps.
+    
+    Args:
+        text (str): The input string to wrap
+        width (int): The maximum width of each line (default: 80)
+        
+    Returns:
+        str: The wrapped text with proper formatting
+    """
+    # Input validation
+    if not isinstance(text, str):
+        raise ValueError("Input text must be a string")
+    
+    if not isinstance(width, int) or width <= 0:
+        raise ValueError("Width must be a positive integer")
+    
+    if not text.strip():
+        return text
+    
+    # Split text into lines
+    lines = text.split('\n')
+    wrapped_lines = []
+    
+    for line in lines:
+        line = line.rstrip()
+        
+        # Skip empty lines
+        if not line:
+            wrapped_lines.append('')
+            continue
+        
+        # Check for bullets or numbered items
+        bullet_match = re.match(r'^(\s*)([-•*]\s+|[0-9]+[.)]\s+)', line)
+        
+        if bullet_match:
+            # Handle bulleted or numbered items
+            indent = bullet_match.group(1)  # Leading whitespace
+            marker = bullet_match.group(2)  # Bullet or number
+            content = line[len(indent + marker):]  # Rest of the text
+            
+            # Wrap the content with proper indentation
+            first_line_indent = indent + marker
+            subsequent_indent = indent + ' ' * len(marker)
+            
+            wrapped = textwrap.fill(
+                content,
+                width=width,
+                initial_indent=first_line_indent,
+                subsequent_indent=subsequent_indent,
+                break_long_words=False
+            )
+            wrapped_lines.append(wrapped)
+        else:
+            # Handle regular paragraphs
+            wrapped = textwrap.fill(
+                line,
+                width=width,
+                break_long_words=False
+            )
+            wrapped_lines.append(wrapped)
+    
+    return '\n'.join(wrapped_lines)
+
+
+# Example usage and testing
+if __name__ == "__main__":
+    # Test with regular text
+    sample_text = "The grgr_id (Group ID) is assigned by Eagle and serves as the unique identifier for each group in the system. The transformation allows for each unique Employer Group ID."
+    
+    print("Regular text:")
+    print(wrap_text(sample_text, 50))
+    print()
+    
+    # Test with bullets
+    bullet_text = """Here are the main steps:
+• First step: Initialize the system and check all parameters carefully
+• Second step: Process the data according to the specified rules
+• Third step: Validate the output and generate reports"""
+    
+    print("Bulleted text:")
+    print(wrap_text(bullet_text, 60))
+    print()
+    
+    # Test with numbered steps
+    numbered_text = """Process overview:
+1. Load the configuration file and validate all settings
+2. Connect to the database and verify credentials
+3. Execute the main processing loop with error handling
+4. Generate final reports and cleanup temporary files"""
+    
+    print("Numbered steps:")
+    print(wrap_text(numbered_text, 55))
+    print()
+    
+    # Test with mixed content
+    mixed_text = """Project Requirements:
+
+This project involves several key components:
+• Data validation and cleanup procedures
+• Report generation with custom formatting
+• Error handling and logging mechanisms
+
+The implementation steps are:
+1. Set up the development environment
+2. Create the core processing functions
+3. Add comprehensive error handling
+4. Test with sample data sets"""
+    
+    print("Mixed content:")
+    print(wrap_text(mixed_text, 65))
